@@ -46,9 +46,18 @@ const MAX_RESPONSE_CHARS = 3000;
 
 // ---------------------------------------------------------------------------
 // Pre-filter regexes (PRD FR-2.2 — factual signal patterns)
+//
+// The original PRD list was too narrow: factual answers about people in
+// office, biographies, or geography rarely contain "in 20XX" / "version X" /
+// "studies show". The expanded list below also catches incumbency, titles,
+// biographical events, geo/civic facts, and authorship.
+//
+// A separate proper-noun heuristic (countProperNounPhrases) catches the
+// long tail of factual responses that don't match any specific pattern.
 // ---------------------------------------------------------------------------
 
 const FACTUAL_SIGNAL_PATTERNS = [
+  // --- Original PRD signals ---
   /\bin\s+(?:19|20)\d{2}\b/i,                  // year reference: "in 2024"
   /\bversion\s+\d+(?:\.\d+)*\b/i,              // version number: "version 3.2"
   /\bv\d+(?:\.\d+){1,3}\b/i,                   // semver-ish: "v3.2.1"
@@ -59,7 +68,52 @@ const FACTUAL_SIGNAL_PATTERNS = [
   /\bstudies\s+show\b/i,
   /\bresearch(?:ers)?\s+(?:show|found|suggest|confirm)\b/i,
   /\bpublished\s+in\s+(?:19|20)\d{2}\b/i,
+
+  // --- Recency / incumbency ---
+  /\b(?:current(?:ly)?|incumbent|present(?:ly)?|sitting)\b/i,
+  /\b(?:as\s+of|since|until)\s+\d/i,
+
+  // --- Titles + offices (people in named roles) ---
+  /\b(?:president|vice\s+president|prime\s+minister|chief\s+minister|cm|pm|ceo|cto|cfo|coo|founder|co-founder|director|chairman|chairperson|secretary|governor|mayor|king|queen|emperor|empress|sultan|prince|princess|pope|sheikh|chancellor|premier|speaker|justice|judge|ambassador|senator|congressman|congresswoman|representative|minister)\b/i,
+
+  // --- Biographical events ---
+  /\b(?:born|died|founded|co-founded|established|launched|released|announced|published|created|invented|discovered|patented|elected|appointed|sworn\s+in|inaugurated|crowned|resigned|retired|deceased|passed\s+away)\b/i,
+
+  // --- Geographic / civic facts ---
+  /\b(?:capital|currency|population|official\s+language|national\s+anthem|national\s+sport|located\s+in|situated\s+in|borders|coastline|area\s+of)\b/i,
+  /\b(?:country|continent|state|province|district|city|town|village|river|mountain|ocean|sea|lake)\s+of\b/i,
+
+  // --- Authorship / attribution ---
+  /\b(?:written|authored|directed|produced|composed|painted|sculpted|designed|engineered|developed|coded|architected|invented|discovered)\s+by\b/i,
+
+  // --- Numeric / quantitative ---
+  /\b(?:19|20)\d{2}\b/,                        // any 4-digit year (broader)
+  /\b\d{1,3}(?:,\d{3})+\b/,                    // big numbers like "1,234,567"
+  /\b\d+(?:\.\d+)?\s*(?:million|billion|trillion|thousand|crore|lakh)\b/i,
+  /\b(?:approximately|roughly|about|around|nearly|over|more\s+than|less\s+than)\s+\d/i,
+
+  // --- Dates / timeline ---
+  /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4}\b/i,
+  /\b\d{1,2}(?:st|nd|rd|th)?\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i,
 ];
+
+// Proper noun phrase heuristic: count distinct sequences of two or more
+// Capitalized words. Three or more such phrases in a response strongly
+// implies it is asserting facts about real-world entities (people, places,
+// products), even when none of the explicit signals above match.
+const PROPER_NOUN_PHRASE_RE = /\b[A-Z][a-z'’]+(?:\s+[A-Z][a-z'’]+){1,4}\b/g;
+const MIN_PROPER_NOUN_PHRASES = 3;
+
+// Stop-words that look like proper nouns at the start of a sentence — we
+// strip these from the count so a response that just starts every sentence
+// with "The" doesn't false-positive.
+const SENTENCE_START_NOISE = new Set([
+  'The', 'This', 'That', 'These', 'Those', 'A', 'An', 'It', 'They', 'You',
+  'We', 'I', 'He', 'She', 'In', 'On', 'At', 'For', 'But', 'And', 'Or',
+  'However', 'Therefore', 'Thus', 'Hence', 'So', 'Because', 'Since',
+  'When', 'Where', 'What', 'Who', 'Why', 'How', 'If', 'Although', 'While',
+  'Yes', 'No', 'Note', 'Important', 'Key', 'Here', 'There',
+]);
 
 // ---------------------------------------------------------------------------
 // State
@@ -113,10 +167,41 @@ function hashText(text) {
 }
 
 function passesPreFilter(text) {
+  // Returns either { passed: true, reason: '<signal>' } or { passed: false }.
+  // Reason is exposed in debug logs so the user can see WHY a message was
+  // routed to Gemini (or skipped).
   for (const re of FACTUAL_SIGNAL_PATTERNS) {
-    if (re.test(text)) return true;
+    const m = text.match(re);
+    if (m) return { passed: true, reason: `regex ${re.source} matched ${JSON.stringify(m[0])}` };
   }
-  return false;
+  const propNouns = countProperNounPhrases(text);
+  if (propNouns >= MIN_PROPER_NOUN_PHRASES) {
+    return { passed: true, reason: `${propNouns} distinct proper-noun phrases` };
+  }
+  return { passed: false, reason: `0 signals, ${propNouns} proper-noun phrases (<${MIN_PROPER_NOUN_PHRASES})` };
+}
+
+function countProperNounPhrases(text) {
+  // Match multi-word capitalized phrases, then drop matches that are purely
+  // a sentence-starting stop word followed by another (e.g. "The Cat" can
+  // still be a proper noun phrase, but we filter pairs where the FIRST word
+  // is a stop word AND the phrase appears right after a sentence boundary).
+  const matches = text.match(PROPER_NOUN_PHRASE_RE);
+  if (!matches) return 0;
+  const distinct = new Set();
+  for (const m of matches) {
+    const firstWord = m.split(/\s+/, 1)[0];
+    if (SENTENCE_START_NOISE.has(firstWord)) {
+      // Trim the leading stop word and re-check that the remainder is still
+      // multi-word.
+      const rest = m.slice(firstWord.length).trim();
+      if (!/\s/.test(rest)) continue;
+      distinct.add(rest);
+    } else {
+      distinct.add(m);
+    }
+  }
+  return distinct.size;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,22 +209,23 @@ function passesPreFilter(text) {
 // ---------------------------------------------------------------------------
 
 function selectorHealthCheck() {
-  // Only assistant messages are guaranteed to be present after a response.
-  // Composer/send button should appear once the chat UI is loaded. We log
-  // warnings rather than failing hard so the extension keeps running.
-  const checks = [
-    ['assistantMessage', SELECTORS.assistantMessage, false],
-    ['composerInput', SELECTORS.composerInput, true],
-    ['sendButton', SELECTORS.sendButton, true],
-  ];
-  for (const [name, selector, expectAtLoad] of checks) {
-    const el = querySelectorWithFallback(selector);
-    if (!el && expectAtLoad) {
-      warn(
-        `Selector health check: "${name}" did not match. ` +
-          'Claude DOM may have changed; injection or detection could fail.',
-      );
-    }
+  // Only the composer is guaranteed to be in the DOM at page load. Assistant
+  // messages don't exist until Claude responds, and the send button only
+  // mounts once text is in the composer. Surface a real warning only for
+  // missing composer; debug-log the others so devs can still see them with
+  // `localStorage.setItem('cfg:debug','1')`.
+  const composer = querySelectorWithFallback(SELECTORS.composerInput);
+  if (!composer) {
+    warn(
+      'Selector health check: composer input not found. ' +
+        'Claude DOM may have changed; correction injection will fail.',
+    );
+  }
+  if (!querySelectorWithFallback(SELECTORS.assistantMessage)) {
+    log('Health check: no assistant message on page yet (expected on a fresh chat).');
+  }
+  if (!querySelectorWithFallback(SELECTORS.sendButton)) {
+    log('Health check: send button not yet in DOM (expected when composer is empty).');
   }
 }
 
@@ -181,11 +267,13 @@ async function handleAssistantMessage(messageEl) {
   }
   seenResponses.add(fingerprint);
 
-  if (!passesPreFilter(rawText)) {
-    log('Pre-filter skipped (no factual signals)');
+  const filterResult = passesPreFilter(rawText);
+  if (!filterResult.passed) {
+    log('Pre-filter skipped:', filterResult.reason);
     notifyPopup({ status: 'skipped' });
     return;
   }
+  log('Pre-filter passed:', filterResult.reason);
 
   const truncated = rawText.length > MAX_RESPONSE_CHARS;
   const responseText = truncated
