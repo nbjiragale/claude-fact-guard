@@ -14,23 +14,34 @@
 // ---------------------------------------------------------------------------
 
 const SELECTORS = {
+  // Assistant messages: today's Claude wraps responses in a div with the
+  // `standard-markdown` class. The legacy data-testid is kept as a fallback
+  // so the extension still works on older builds.
   assistantMessage: {
-    primary: '[data-testid="assistant-message"]',
-    fallback: '.font-claude-message',
+    primary: '.standard-markdown',
+    fallback: '[data-testid="assistant-message"], .font-claude-message',
   },
+  // Composer input: `data-testid="chat-input"` lives directly on the
+  // contenteditable. The role-based selector is the broad fallback.
   composerInput: {
-    primary: '[data-testid="composer-input"] [contenteditable]',
-    fallback: '[contenteditable][role="textbox"]',
+    primary: '[data-testid="chat-input"]',
+    fallback: '[contenteditable="true"][role="textbox"]',
   },
+  // Send button: only materializes after text is in the composer. Multiple
+  // selectors are tried in order; an additional heuristic (`findSendButton`)
+  // walks up from the composer to find a near-by submit-style button.
   sendButton: {
     primary: '[data-testid="send-button"]',
-    fallback: 'button[type="submit"]',
+    fallback:
+      'button[aria-label="Send message" i], button[aria-label="Send" i], button[aria-label*="Send message" i]:not([aria-label*="voice" i]), button[type="submit"]',
   },
 };
 
 // Tunable constants (PRD FR-1.3, FR-3.3, FR-4.4)
 const DEBOUNCE_MS = 1200;
 const INJECT_DELAY_MS = 300;
+const SEND_BUTTON_POLL_INTERVAL_MS = 150;
+const SEND_BUTTON_POLL_MAX_MS = 3000;
 const MAX_RESPONSE_CHARS = 3000;
 
 // ---------------------------------------------------------------------------
@@ -239,37 +250,106 @@ function injectCorrection(correctionPrompt) {
   }
   composerBusyWarned = false;
 
-  // Set text and notify React's synthetic event system (PRD FR-4.3)
+  // Set text and notify the editor framework (PRD FR-4.3). Today's Claude
+  // composer is a Tiptap/ProseMirror contenteditable, which listens for
+  // `beforeinput` and `input` events to update its document model.
   composer.focus();
-  composer.innerText = correctionPrompt;
+  setComposerText(composer, correctionPrompt);
+
+  // Poll for the send button: it's typically not in the DOM until text is
+  // present, and may take a moment to mount after the input event.
+  const startedAt = Date.now();
+  const initialDelay = INJECT_DELAY_MS;
+  setTimeout(() => pollAndClickSend(composer, startedAt), initialDelay);
+
+  return true;
+}
+
+function setComposerText(composer, text) {
+  // Strategy 1: dispatch a beforeinput with `insertReplacementText` and the
+  // full string as `data`. This is what ProseMirror reacts to natively.
+  try {
+    const beforeInput = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'insertReplacementText',
+      data: text,
+      // dataTransfer is read-only via property; provide via constructor when
+      // supported by the runtime.
+    });
+    const accepted = composer.dispatchEvent(beforeInput);
+    if (accepted) {
+      // Some editors handle the event natively and update their model. If
+      // they didn't (event not preventDefault'd by the editor), fall through
+      // to the textContent-set path below.
+    }
+  } catch (_) {
+    /* InputEvent might reject the inputType in some browsers; ignore. */
+  }
+
+  // Strategy 2: directly set the editor text and dispatch an input event so
+  // React/Tiptap's synthetic event system picks up the change. Clearing the
+  // node first avoids leaving stray ProseMirror placeholder nodes.
+  while (composer.firstChild) composer.removeChild(composer.firstChild);
+  composer.appendChild(document.createTextNode(text));
 
   const inputEvent = new InputEvent('input', {
     bubbles: true,
     cancelable: true,
     inputType: 'insertText',
-    data: correctionPrompt,
+    data: text,
   });
   composer.dispatchEvent(inputEvent);
 
-  // Some Claude builds also rely on a native "change"-style event on the
-  // contenteditable; dispatch a generic one as a safety net.
+  // Generic safety-net change event for any non-React listeners.
   composer.dispatchEvent(new Event('change', { bubbles: true }));
+}
 
-  setTimeout(() => {
-    const sendBtn = querySelectorWithFallback(SELECTORS.sendButton);
-    if (!sendBtn) {
-      warn('Send button not found; correction text was injected but not submitted');
-      return;
-    }
-    if (sendBtn.disabled) {
-      warn('Send button is disabled; correction text was injected but not submitted');
-      return;
-    }
+function pollAndClickSend(composer, startedAt) {
+  const sendBtn = findSendButton(composer);
+  if (sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {
     sendBtn.click();
     log('Correction submitted');
-  }, INJECT_DELAY_MS);
+    return;
+  }
 
-  return true;
+  if (Date.now() - startedAt >= SEND_BUTTON_POLL_MAX_MS) {
+    warn(
+      'Send button never became clickable after injection (waited',
+      SEND_BUTTON_POLL_MAX_MS,
+      'ms). Correction text is in the composer but was not submitted.',
+    );
+    return;
+  }
+
+  setTimeout(
+    () => pollAndClickSend(composer, startedAt),
+    SEND_BUTTON_POLL_INTERVAL_MS,
+  );
+}
+
+function findSendButton(composer) {
+  // 1. Try declared selectors.
+  const declared = querySelectorWithFallback(SELECTORS.sendButton);
+  if (declared) return declared;
+
+  // 2. Walk up from the composer and find a near-by submit-style button.
+  let scope = composer.closest('form') || composer.parentElement;
+  while (scope && scope !== document.body) {
+    const candidates = Array.from(scope.querySelectorAll('button')).filter(
+      (b) => {
+        if (b.disabled) return false;
+        if (b.offsetParent === null) return false; // not visible
+        const label = (b.getAttribute('aria-label') || '').toLowerCase();
+        if (label.includes('send')) return true;
+        if (b.type === 'submit') return true;
+        return false;
+      },
+    );
+    if (candidates.length > 0) return candidates[candidates.length - 1];
+    scope = scope.parentElement;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------

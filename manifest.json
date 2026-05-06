@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Fact Guard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Silently fact-checks Claude AI responses with Google Gemini (Search Grounding) and auto-injects targeted corrections.",
   "minimum_chrome_version": "120",
   "icons": {
