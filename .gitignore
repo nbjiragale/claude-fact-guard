@@ -1,0 +1,28 @@
+# Build artifacts
+dist/
+*.zip
+*.crx
+*.pem
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Node (in case we add tooling later)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python (only used by scripts/generate-icons.py)
+__pycache__/
+*.pyc
+.venv/
+
+# Local secrets — never commit
+.env
+.env.*
+!.env.example
