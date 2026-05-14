@@ -1,61 +1,131 @@
 // Claude Fact Guard — background service worker (MV3)
 //
-// Receives VERIFY messages from the content script, calls Gemini 2.0 Flash
-// with Google Search Grounding, parses the structured JSON verdict, and
-// returns it. Also tracks per-session counters and the last verdict so the
-// popup can render live status (PRD FR-5.3, FR-5.4).
+// Receives messages from the side panel:
+//   - VERIFY:        fact-check the latest Claude response with Perplexity Sonar
+//   - SET_CONTEXT:   store an interview-prep context that will be prepended to
+//                    every subsequent VERIFY call (also used standalone as a
+//                    sanity check that the API key + provider work)
+//   - GET_STATE:     return current settings + last verdict for UI hydration
+//   - RESET_STATS:   zero the per-session counters
+//
+// Also opens the side panel when the toolbar action icon is clicked.
+//
+// Only Perplexity Sonar is supported, via two API paths:
+//   - Direct:     https://api.perplexity.ai/chat/completions
+//   - OpenRouter: https://openrouter.ai/api/v1/chat/completions  (model = perplexity/<sonar-variant>)
 
-const GEMINI_ENDPOINT =
-  'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
-
-const MAX_RESPONSE_CHARS = 3000;
+const PROVIDERS = {
+  perplexity: {
+    label: 'Perplexity (direct)',
+    endpoint: 'https://api.perplexity.ai/chat/completions',
+    models: [
+      { id: 'sonar', label: 'Sonar — cheapest, web-grounded (recommended)' },
+      { id: 'sonar-pro', label: 'Sonar Pro — stronger search + longer context' },
+      { id: 'sonar-reasoning', label: 'Sonar Reasoning — reasoning + search' },
+      { id: 'sonar-reasoning-pro', label: 'Sonar Reasoning Pro — strongest, slowest' },
+    ],
+    defaultModel: 'sonar',
+    keyHint: 'pplx-...',
+    keyHelpUrl: 'https://www.perplexity.ai/settings/api',
+  },
+  openrouter: {
+    label: 'OpenRouter',
+    endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+    models: [
+      { id: 'perplexity/sonar', label: 'perplexity/sonar — cheapest, web-grounded (recommended)' },
+      { id: 'perplexity/sonar-pro', label: 'perplexity/sonar-pro — stronger search + longer context' },
+      { id: 'perplexity/sonar-reasoning', label: 'perplexity/sonar-reasoning — reasoning + search' },
+      { id: 'perplexity/sonar-reasoning-pro', label: 'perplexity/sonar-reasoning-pro — strongest' },
+    ],
+    defaultModel: 'perplexity/sonar',
+    keyHint: 'sk-or-...',
+    keyHelpUrl: 'https://openrouter.ai/settings/keys',
+  },
+};
 
 const STORAGE_KEYS = {
-  apiKey: 'geminiKey',
-  enabled: 'enabled',
+  provider: 'provider',
+  apiKey: {
+    perplexity: 'pplxKey',
+    openrouter: 'openrouterKey',
+  },
+  model: 'model',
+  context: 'context',
 };
+
+const MAX_RESPONSE_CHARS = 8000;
+const MAX_CONTEXT_CHARS = 8000;
 
 const SESSION_DEFAULTS = {
   verifications: 0,
-  corrections: 0,
-  skipped: 0,
+  inaccurate: 0,
   errors: 0,
   lastStatus: 'idle',
   lastError: null,
+  lastVerdict: null,
   updatedAt: 0,
 };
+
+// ---------------------------------------------------------------------------
+// Toolbar action -> open side panel
+// ---------------------------------------------------------------------------
+
+chrome.runtime.onInstalled.addListener(() => {
+  if (chrome.sidePanel?.setPanelBehavior) {
+    chrome.sidePanel
+      .setPanelBehavior({ openPanelOnActionClick: true })
+      .catch(() => {});
+  }
+});
+
+chrome.action?.onClicked.addListener(async (tab) => {
+  if (!chrome.sidePanel?.open) return;
+  try {
+    if (tab?.windowId != null) {
+      await chrome.sidePanel.open({ windowId: tab.windowId });
+    }
+  } catch (err) {
+    console.warn('[CFG] sidePanel.open failed', err);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Storage helpers
 // ---------------------------------------------------------------------------
 
-function getSyncStorage(keys) {
-  return new Promise((resolve) => {
-    chrome.storage.sync.get(keys, (result) => resolve(result || {}));
-  });
+function getSync(keys) {
+  return new Promise((resolve) =>
+    chrome.storage.sync.get(keys, (r) => resolve(r || {})),
+  );
 }
 
-function getSessionStorage(keys) {
-  return new Promise((resolve) => {
-    chrome.storage.session.get(keys, (result) => resolve(result || {}));
-  });
+function setSync(values) {
+  return new Promise((resolve) =>
+    chrome.storage.sync.set(values, () => resolve()),
+  );
 }
 
-function setSessionStorage(values) {
-  return new Promise((resolve) => {
-    chrome.storage.session.set(values, () => resolve());
-  });
+function getSession(keys) {
+  return new Promise((resolve) =>
+    chrome.storage.session.get(keys, (r) => resolve(r || {})),
+  );
+}
+
+function setSessionVal(values) {
+  return new Promise((resolve) =>
+    chrome.storage.session.set(values, () => resolve()),
+  );
 }
 
 async function getStats() {
-  const data = await getSessionStorage('stats');
+  const data = await getSession('stats');
   return { ...SESSION_DEFAULTS, ...(data.stats || {}) };
 }
 
 async function updateStats(patch) {
   const current = await getStats();
   const next = { ...current, ...patch, updatedAt: Date.now() };
-  await setSessionStorage({ stats: next });
+  await setSessionVal({ stats: next });
   return next;
 }
 
@@ -64,59 +134,136 @@ async function bumpStats(field) {
   return updateStats({ [field]: (current[field] || 0) + 1 });
 }
 
-// ---------------------------------------------------------------------------
-// Prompt construction (PRD §Gemini API Request Format)
-// ---------------------------------------------------------------------------
-
-function buildVerificationPrompt(responseText, truncated) {
-  const truncationNote = truncated
-    ? '\n\n(Note: the response was truncated to the first 3000 characters before being sent for verification.)'
-    : '';
-  return [
-    'You are a fact-checker. A user received this AI response:',
-    '---',
-    responseText,
-    '---',
-    'Using Google Search, identify any factually inaccurate, outdated, or misleading claims.',
-    '',
-    'Respond ONLY with a single JSON object — no Markdown, no code fences, no commentary — matching this schema exactly:',
-    '{',
-    '  "accurate": boolean,',
-    '  "issues": string[],',
-    '  "correctionPrompt": string',
-    '}',
-    '',
-    'Rules:',
-    '- If the response is fully accurate, set "accurate" to true, "issues" to [], and "correctionPrompt" to "".',
-    '- If you find inaccuracies, set "accurate" to false, list each one in "issues" as a short specific bullet, and provide a "correctionPrompt" the user can paste back to the original AI.',
-    '- The "correctionPrompt" must follow this exact template, filling in the bullet list:',
-    '    "I need to correct something in your previous response.\\nGemini with Google Search found the following issues:\\n- <issue 1>\\n- <issue 2>\\nPlease correct only those points and keep the rest of the explanation unchanged."',
-    '- Do not flag opinions, stylistic choices, or purely conceptual explanations.',
-    '- Be conservative: only flag claims you can verify as wrong with Search.',
-    truncationNote,
-  ].join('\n');
+async function getSettings() {
+  const data = await getSync([
+    STORAGE_KEYS.provider,
+    STORAGE_KEYS.apiKey.perplexity,
+    STORAGE_KEYS.apiKey.openrouter,
+    STORAGE_KEYS.model,
+    STORAGE_KEYS.context,
+  ]);
+  const provider =
+    data[STORAGE_KEYS.provider] && PROVIDERS[data[STORAGE_KEYS.provider]]
+      ? data[STORAGE_KEYS.provider]
+      : 'perplexity';
+  const providerCfg = PROVIDERS[provider];
+  const model =
+    data[STORAGE_KEYS.model] &&
+    providerCfg.models.some((m) => m.id === data[STORAGE_KEYS.model])
+      ? data[STORAGE_KEYS.model]
+      : providerCfg.defaultModel;
+  return {
+    provider,
+    perplexityKey: data[STORAGE_KEYS.apiKey.perplexity] || '',
+    openrouterKey: data[STORAGE_KEYS.apiKey.openrouter] || '',
+    model,
+    context: data[STORAGE_KEYS.context] || '',
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Gemini call (PRD FR-3)
+// Prompt construction — strict fact-checker
 // ---------------------------------------------------------------------------
 
-function extractJsonFromGeminiResponse(data) {
-  const parts = data?.candidates?.[0]?.content?.parts;
-  if (!Array.isArray(parts)) return null;
-  const text = parts
-    .map((p) => (typeof p?.text === 'string' ? p.text : ''))
-    .join('')
-    .trim();
-  if (!text) return null;
+const SYSTEM_PROMPT = [
+  'You are a critical fact-checker for an interview preparation session.',
+  'Your only job is to verify the accuracy of an AI assistant response against authoritative, up-to-date web sources.',
+  'Be extremely strict: flag anything even slightly inaccurate, outdated, or misleading — even if only 1% is wrong.',
+  'Do NOT add new tangential information. Do NOT flag opinions, stylistic choices, or purely conceptual explanations.',
+  'Do NOT mention Perplexity, Gemini, ChatGPT, OpenAI, OpenRouter, or any tool/model name in the correction.',
+  '',
+  'You MUST output a single JSON object only — no Markdown, no code fences, no commentary — matching this schema:',
+  '{',
+  '  "accurate": boolean,',
+  '  "issues": string[],',
+  '  "correction": string',
+  '}',
+  '',
+  'If the response is fully accurate: accurate=true, issues=[], correction="".',
+  'If inaccurate: accurate=false, list each specific error in "issues", and produce ONE "correction" string the user can paste back to the original assistant, phrased EXACTLY as:',
+  '  "Actually <wrong claim> is wrong — the correct fact is <correct fact> because <brief verifiable reason>."',
+  'If there are multiple issues, chain them in the same sentence using ". Also, " between each fact, but keep using the same "Actually … is wrong — the correct fact is … because …" template for every issue.',
+  'End the correction with: " Please correct only those points and keep the rest of the explanation unchanged."',
+].join('\n');
 
-  // Models occasionally wrap JSON in ``` fences despite the prompt; strip them.
-  const cleaned = text
+function buildUserPrompt({ context, responseText, truncated }) {
+  const lines = [];
+  if (context && context.trim()) {
+    lines.push('[Interview-prep session context — use this to understand the topic, do NOT fact-check this section]:');
+    lines.push(context.trim());
+    lines.push('');
+  }
+  lines.push('[Assistant response to fact-check — verify every factual claim with web search]:');
+  lines.push(responseText);
+  if (truncated) {
+    lines.push('');
+    lines.push(`(Note: the response was truncated to the first ${MAX_RESPONSE_CHARS} characters before being sent.)`);
+  }
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Provider call
+// ---------------------------------------------------------------------------
+
+async function callProvider({ provider, apiKey, model, system, user }) {
+  const cfg = PROVIDERS[provider];
+  if (!cfg) throw new Error(`Unknown provider: ${provider}`);
+  if (!apiKey) throw new Error('Missing API key. Open Settings in the side panel and add one.');
+
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`,
+  };
+  if (provider === 'openrouter') {
+    // Optional but recommended by OpenRouter for attribution.
+    headers['HTTP-Referer'] = 'https://github.com/nbjiragale/claude-fact-guard';
+    headers['X-Title'] = 'Claude Fact Guard';
+  }
+
+  const body = {
+    model,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+    temperature: 0.1,
+  };
+
+  const resp = await fetch(cfg.endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    let detail = '';
+    try {
+      const errBody = await resp.text();
+      detail = errBody.slice(0, 400);
+    } catch (_) {
+      /* ignore */
+    }
+    throw new Error(`${cfg.label} HTTP ${resp.status}: ${detail || resp.statusText}`);
+  }
+
+  const data = await resp.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new Error('Provider returned an empty response.');
+  }
+  const citations = Array.isArray(data?.citations)
+    ? data.citations.filter((c) => typeof c === 'string')
+    : [];
+  return { content, citations };
+}
+
+function extractJson(text) {
+  const trimmed = text.trim();
+  const cleaned = trimmed
     .replace(/^```(?:json)?\s*/i, '')
     .replace(/\s*```$/i, '')
     .trim();
-
-  // Fallback: locate the first {...} block if any leading prose slipped in.
   let candidate = cleaned;
   if (!candidate.startsWith('{')) {
     const start = candidate.indexOf('{');
@@ -124,154 +271,166 @@ function extractJsonFromGeminiResponse(data) {
     if (start === -1 || end === -1 || end <= start) return null;
     candidate = candidate.slice(start, end + 1);
   }
-
   try {
     return JSON.parse(candidate);
-  } catch (_err) {
+  } catch (_) {
     return null;
   }
 }
 
-function normalizeVerdict(parsed) {
+function normalizeVerdict(parsed, citations) {
   if (!parsed || typeof parsed !== 'object') return null;
-  const accurate = typeof parsed.accurate === 'boolean' ? parsed.accurate : null;
+  const accurate =
+    typeof parsed.accurate === 'boolean' ? parsed.accurate : null;
   if (accurate === null) return null;
   const issues = Array.isArray(parsed.issues)
-    ? parsed.issues.filter((s) => typeof s === 'string' && s.trim().length > 0)
+    ? parsed.issues
+        .map((s) => (typeof s === 'string' ? s.trim() : ''))
+        .filter((s) => s.length > 0)
     : [];
-  const correctionPrompt =
-    typeof parsed.correctionPrompt === 'string' ? parsed.correctionPrompt : '';
+  const correction =
+    typeof parsed.correction === 'string' ? parsed.correction.trim() : '';
   return {
     accurate,
     issues,
-    correctionPrompt: accurate ? '' : correctionPrompt.trim(),
+    correction: accurate ? '' : correction,
+    citations: Array.isArray(citations) ? citations : [],
   };
 }
 
-async function callGemini(apiKey, responseText, truncated) {
-  const body = {
-    contents: [
-      {
-        parts: [{ text: buildVerificationPrompt(responseText, truncated) }],
-      },
-    ],
-    tools: [{ google_search: {} }],
-  };
+// ---------------------------------------------------------------------------
+// Verify flow
+// ---------------------------------------------------------------------------
 
-  const url = `${GEMINI_ENDPOINT}?key=${encodeURIComponent(apiKey)}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
+async function handleVerify(payload) {
+  const settings = await getSettings();
+  const apiKey =
+    settings.provider === 'perplexity'
+      ? settings.perplexityKey
+      : settings.openrouterKey;
+
+  await updateStats({ lastStatus: 'checking', lastError: null });
+
+  const rawText = (payload?.text || '').toString();
+  if (!rawText.trim()) {
+    const err = 'No assistant response text found to verify. Open Claude.ai and wait for an answer first.';
+    await updateStats({ lastStatus: 'error', lastError: err });
+    await bumpStats('errors');
+    return { ok: false, error: err };
+  }
+  const truncated = rawText.length > MAX_RESPONSE_CHARS;
+  const responseText = truncated ? rawText.slice(0, MAX_RESPONSE_CHARS) : rawText;
+
+  const userPrompt = buildUserPrompt({
+    context: settings.context,
+    responseText,
+    truncated,
   });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Gemini API ${res.status}: ${text.slice(0, 200)}`);
-  }
-
-  const data = await res.json();
-  const parsed = extractJsonFromGeminiResponse(data);
-  const verdict = normalizeVerdict(parsed);
-  if (!verdict) throw new Error('Gemini returned malformed JSON');
-  return verdict;
-}
-
-// ---------------------------------------------------------------------------
-// Message handlers
-// ---------------------------------------------------------------------------
-
-async function handleVerify(message) {
-  const settings = await getSyncStorage([STORAGE_KEYS.apiKey, STORAGE_KEYS.enabled]);
-  const enabled = settings[STORAGE_KEYS.enabled] !== false; // default ON
-  const apiKey = settings[STORAGE_KEYS.apiKey];
-
-  if (!enabled) {
-    return { ok: false, error: 'disabled', accurate: true, correctionPrompt: '' };
-  }
-  if (!apiKey) {
-    await updateStats({ lastStatus: 'no-key', lastError: 'API key missing' });
-    return { ok: false, error: 'no-key', accurate: true, correctionPrompt: '' };
-  }
-
-  const text = (message.text || '').slice(0, MAX_RESPONSE_CHARS);
-  const truncated = Boolean(message.truncated);
-
   try {
-    const verdict = await callGemini(apiKey, text, truncated);
-    await bumpStats('verifications');
-    if (!verdict.accurate && verdict.correctionPrompt) {
-      await bumpStats('corrections');
-      await updateStats({ lastStatus: 'corrected', lastError: null });
-    } else {
-      await updateStats({ lastStatus: 'accurate', lastError: null });
-    }
-    return { ok: true, ...verdict };
-  } catch (err) {
-    const msg = String(err && err.message ? err.message : err);
-    // PRD FR-3.4: silently fail on the page side; we still log here.
-    // eslint-disable-next-line no-console
-    console.warn('[ClaudeFactGuard:bg] verification failed', msg);
-    await bumpStats('errors');
-    await updateStats({ lastStatus: 'error', lastError: msg });
-    return { ok: false, error: msg, accurate: true, correctionPrompt: '' };
-  }
-}
-
-async function handleStatus(message) {
-  const status = message?.payload?.status;
-  if (!status) return;
-  if (status === 'skipped') {
-    await bumpStats('skipped');
-    await updateStats({ lastStatus: 'skipped', lastError: null });
-  } else if (status === 'checking') {
-    await updateStats({ lastStatus: 'checking', lastError: null });
-  } else if (status === 'busy') {
-    await updateStats({ lastStatus: 'busy', lastError: null });
-  } else if (status === 'error') {
-    await bumpStats('errors');
-    await updateStats({
-      lastStatus: 'error',
-      lastError: message?.payload?.error || 'unknown error',
+    const { content, citations } = await callProvider({
+      provider: settings.provider,
+      apiKey,
+      model: settings.model,
+      system: SYSTEM_PROMPT,
+      user: userPrompt,
     });
-  } else if (status === 'accurate' || status === 'corrected') {
-    await updateStats({ lastStatus: status, lastError: null });
+    const parsed = extractJson(content);
+    const verdict = normalizeVerdict(parsed, citations);
+    if (!verdict) {
+      const err = 'Could not parse a JSON verdict from the provider response.';
+      await updateStats({ lastStatus: 'error', lastError: err, lastVerdict: null });
+      await bumpStats('errors');
+      return { ok: false, error: err, raw: content };
+    }
+    await bumpStats('verifications');
+    if (!verdict.accurate) await bumpStats('inaccurate');
+    await updateStats({
+      lastStatus: verdict.accurate ? 'accurate' : 'inaccurate',
+      lastError: null,
+      lastVerdict: verdict,
+    });
+    return { ok: true, verdict };
+  } catch (err) {
+    const msg = err?.message || String(err);
+    await updateStats({ lastStatus: 'error', lastError: msg });
+    await bumpStats('errors');
+    return { ok: false, error: msg };
   }
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || typeof message !== 'object') return false;
+// ---------------------------------------------------------------------------
+// Message router
+// ---------------------------------------------------------------------------
 
-  if (message.type === 'VERIFY') {
-    handleVerify(message).then(sendResponse);
-    return true; // keep the channel open for async sendResponse
-  }
-
-  if (message.type === 'STATUS') {
-    handleStatus(message).then(() => sendResponse({ ok: true }));
-    return true;
-  }
-
-  if (message.type === 'GET_STATS') {
-    getStats().then((stats) => sendResponse({ ok: true, stats }));
-    return true;
-  }
-
-  if (message.type === 'RESET_STATS') {
-    setSessionStorage({ stats: { ...SESSION_DEFAULTS, updatedAt: Date.now() } }).then(
-      () => sendResponse({ ok: true }),
-    );
-    return true;
-  }
-
-  return false;
-});
-
-// Initialize defaults on install so the popup has something coherent to show.
-chrome.runtime.onInstalled.addListener(async () => {
-  const existing = await getSyncStorage([STORAGE_KEYS.enabled]);
-  if (typeof existing[STORAGE_KEYS.enabled] !== 'boolean') {
-    chrome.storage.sync.set({ [STORAGE_KEYS.enabled]: true });
-  }
-  await setSessionStorage({ stats: { ...SESSION_DEFAULTS, updatedAt: Date.now() } });
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  (async () => {
+    try {
+      switch (msg?.type) {
+        case 'VERIFY': {
+          const out = await handleVerify(msg);
+          sendResponse(out);
+          return;
+        }
+        case 'SET_CONTEXT': {
+          const text = (msg.text || '').toString().slice(0, MAX_CONTEXT_CHARS);
+          await setSync({ [STORAGE_KEYS.context]: text });
+          sendResponse({ ok: true });
+          return;
+        }
+        case 'GET_STATE': {
+          const settings = await getSettings();
+          const stats = await getStats();
+          sendResponse({
+            ok: true,
+            settings,
+            stats,
+            providers: PROVIDERS,
+          });
+          return;
+        }
+        case 'GET_STATS': {
+          const stats = await getStats();
+          sendResponse({ ok: true, stats });
+          return;
+        }
+        case 'RESET_STATS': {
+          await updateStats({
+            ...SESSION_DEFAULTS,
+            verifications: 0,
+            inaccurate: 0,
+            errors: 0,
+            lastVerdict: null,
+            lastStatus: 'idle',
+            lastError: null,
+          });
+          sendResponse({ ok: true });
+          return;
+        }
+        case 'SAVE_SETTINGS': {
+          const patch = {};
+          if (msg.provider && PROVIDERS[msg.provider]) {
+            patch[STORAGE_KEYS.provider] = msg.provider;
+          }
+          if (typeof msg.perplexityKey === 'string') {
+            patch[STORAGE_KEYS.apiKey.perplexity] = msg.perplexityKey.trim();
+          }
+          if (typeof msg.openrouterKey === 'string') {
+            patch[STORAGE_KEYS.apiKey.openrouter] = msg.openrouterKey.trim();
+          }
+          if (typeof msg.model === 'string' && msg.model) {
+            patch[STORAGE_KEYS.model] = msg.model;
+          }
+          await setSync(patch);
+          sendResponse({ ok: true });
+          return;
+        }
+        default:
+          sendResponse({ ok: false, error: `Unknown message type: ${msg?.type}` });
+      }
+    } catch (err) {
+      sendResponse({ ok: false, error: err?.message || String(err) });
+    }
+  })();
+  return true; // async response
 });

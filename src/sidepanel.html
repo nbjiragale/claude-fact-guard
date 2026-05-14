@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Fact Guard</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="header">
+      <h1>Claude Fact Guard</h1>
+      <span class="version" id="version-label"></span>
+    </header>
+
+    <p class="tab-warning" id="tab-warning" hidden>
+      Open <a href="https://claude.ai" target="_blank" rel="noreferrer noopener">claude.ai</a>
+      in the current tab — this panel only works there.
+    </p>
+
+    <details class="card" id="settings-card" open>
+      <summary>
+        <span class="card-title">Settings</span>
+        <span class="card-sub" id="settings-summary">Perplexity Sonar · no key</span>
+      </summary>
+      <div class="card-body">
+        <label class="field">
+          <span>Provider</span>
+          <div class="radio-row">
+            <label class="radio">
+              <input type="radio" name="provider" value="perplexity" />
+              Perplexity (direct)
+            </label>
+            <label class="radio">
+              <input type="radio" name="provider" value="openrouter" />
+              OpenRouter
+            </label>
+          </div>
+        </label>
+
+        <label class="field">
+          <span>API key</span>
+          <input
+            type="password"
+            id="api-key"
+            placeholder="pplx-..."
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <p class="hint" id="api-key-hint">
+            Get one at
+            <a id="api-key-link" href="https://www.perplexity.ai/settings/api" target="_blank" rel="noreferrer noopener">Perplexity API settings</a>.
+            Stored in <code>chrome.storage.sync</code>. Sent only to the chosen
+            provider's API endpoint.
+          </p>
+        </label>
+
+        <label class="field">
+          <span>Model</span>
+          <select id="model-select"></select>
+        </label>
+
+        <button class="primary" id="save-settings">Save settings</button>
+      </div>
+    </details>
+
+    <details class="card" id="context-card" open>
+      <summary>
+        <span class="card-title">Session context</span>
+        <span class="card-sub" id="context-summary">Empty — optional but recommended</span>
+      </summary>
+      <div class="card-body">
+        <p class="hint">
+          Paste what you're studying / interviewing for (topic, level, scope).
+          It's prepended to every fact-check so Sonar judges Claude's answers
+          against the right reference frame.
+        </p>
+        <textarea
+          id="context-input"
+          rows="6"
+          placeholder="e.g. SDE-2 backend interview prep. Topics: distributed systems (CAP, consensus, sharding), JVM internals, Spring Boot 3, PostgreSQL indexing. Be strict on version numbers and dates."
+        ></textarea>
+        <div class="button-row">
+          <button class="secondary" id="save-context">Save context</button>
+          <button class="ghost" id="paste-context">Paste into Claude</button>
+          <button class="ghost" id="paste-send-context">Paste &amp; send</button>
+        </div>
+        <p class="micro" id="context-status"></p>
+      </div>
+    </details>
+
+    <section class="card verify">
+      <div class="card-body">
+        <button class="primary big" id="verify-btn">
+          Verify latest Claude response
+        </button>
+        <div class="status-row">
+          <span class="status-dot" id="status-dot"></span>
+          <span class="status-label" id="status-label">Idle</span>
+        </div>
+        <p class="status-error" id="status-error" hidden></p>
+      </div>
+    </section>
+
+    <section class="card result" id="result-card" hidden>
+      <div class="card-body">
+        <div class="verdict-row">
+          <span class="verdict-badge" id="verdict-badge">—</span>
+          <span class="verdict-label" id="verdict-label"></span>
+        </div>
+
+        <div id="issues-block" hidden>
+          <h3>Issues</h3>
+          <ul id="issues-list"></ul>
+        </div>
+
+        <div id="correction-block" hidden>
+          <h3>Correction to paste into Claude</h3>
+          <pre id="correction-text"></pre>
+          <div class="button-row">
+            <button class="primary" id="paste-correction">Paste</button>
+            <button class="primary" id="paste-send-correction">Paste &amp; send</button>
+            <button class="ghost" id="copy-correction">Copy</button>
+          </div>
+        </div>
+
+        <div id="citations-block" hidden>
+          <h3>Sources</h3>
+          <ol id="citations-list"></ol>
+        </div>
+      </div>
+    </section>
+
+    <section class="stats">
+      <div class="stat"><span>Verified</span><strong id="stat-verifications">0</strong></div>
+      <div class="stat"><span>Inaccurate</span><strong id="stat-inaccurate">0</strong></div>
+      <div class="stat"><span>Errors</span><strong id="stat-errors">0</strong></div>
+      <button class="ghost small" id="reset-stats">Reset</button>
+    </section>
+
+    <footer>
+      <a href="https://github.com/nbjiragale/claude-fact-guard" target="_blank" rel="noreferrer noopener">GitHub</a>
+      ·
+      <a href="PRIVACY.html" target="_blank" rel="noreferrer noopener">Privacy</a>
+    </footer>
+
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
