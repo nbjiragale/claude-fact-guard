@@ -1,23 +1,42 @@
 // Claude Fact Guard — background service worker (MV3)
 //
 // Receives messages from the side panel:
-//   - VERIFY:        fact-check the latest Claude response with Perplexity Sonar
-//   - SET_CONTEXT:   store an interview-prep context that will be prepended to
-//                    every subsequent VERIFY call (also used standalone as a
-//                    sanity check that the API key + provider work)
+//   - VERIFY:        fact-check the latest Claude response using the chosen
+//                    provider (Perplexity Web tab, Perplexity API, or OpenRouter)
+//   - SET_CONTEXT:   store an interview-prep context that gets prepended to
+//                    every subsequent VERIFY call (or, for the web provider,
+//                    seeded into the Perplexity thread on first use)
 //   - GET_STATE:     return current settings + last verdict for UI hydration
 //   - RESET_STATS:   zero the per-session counters
+//   - RESET_PERPLEXITY_THREAD: forget the current Perplexity thread tab and
+//                              start a fresh one on the next VERIFY
+//   - OPEN_PERPLEXITY_TAB:     focus or create the Perplexity tab
 //
 // Also opens the side panel when the toolbar action icon is clicked.
 //
-// Only Perplexity Sonar is supported, via two API paths:
-//   - Direct:     https://api.perplexity.ai/chat/completions
-//   - OpenRouter: https://openrouter.ai/api/v1/chat/completions  (model = perplexity/<sonar-variant>)
+// Three providers are supported:
+//   - perplexity-web: drive the user's logged-in www.perplexity.ai tab via
+//                     a content script (no API cost — rides on Pro subscription)
+//   - perplexity:     direct REST call to https://api.perplexity.ai/chat/completions
+//   - openrouter:     https://openrouter.ai/api/v1/chat/completions (model = perplexity/<sonar-variant>)
 
 const PROVIDERS = {
+  'perplexity-web': {
+    label: 'Perplexity Web (your tab)',
+    kind: 'web',
+    requiresKey: false,
+    models: [
+      { id: 'web', label: 'Whatever your Perplexity tab is set to (Pro / Sonar / Auto)' },
+    ],
+    defaultModel: 'web',
+    keyHint: '',
+    keyHelpUrl: 'https://www.perplexity.ai/',
+  },
   perplexity: {
-    label: 'Perplexity (direct)',
+    label: 'Perplexity API (direct)',
+    kind: 'api',
     endpoint: 'https://api.perplexity.ai/chat/completions',
+    requiresKey: true,
     models: [
       { id: 'sonar', label: 'Sonar — cheapest, web-grounded (recommended)' },
       { id: 'sonar-pro', label: 'Sonar Pro — stronger search + longer context' },
@@ -30,7 +49,9 @@ const PROVIDERS = {
   },
   openrouter: {
     label: 'OpenRouter',
+    kind: 'api',
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+    requiresKey: true,
     models: [
       { id: 'perplexity/sonar', label: 'perplexity/sonar — cheapest, web-grounded (recommended)' },
       { id: 'perplexity/sonar-pro', label: 'perplexity/sonar-pro — stronger search + longer context' },
@@ -43,6 +64,10 @@ const PROVIDERS = {
   },
 };
 
+const DEFAULT_PROVIDER = 'perplexity-web';
+const PERPLEXITY_URL = 'https://www.perplexity.ai/';
+const PERPLEXITY_HOST_RE = /^https:\/\/(?:www\.)?perplexity\.ai\//;
+
 const STORAGE_KEYS = {
   provider: 'provider',
   apiKey: {
@@ -51,10 +76,39 @@ const STORAGE_KEYS = {
   },
   model: 'model',
   context: 'context',
+  // perplexity-web only
+  webVisible: 'perplexityWebVisible',
+  webCustomInstructions: 'perplexityWebCustomInstructions',
 };
+
+const SESSION_KEYS = {
+  stats: 'stats',
+  webThreadTabId: 'pplxThreadTabId',
+  webThreadSeeded: 'pplxThreadSeeded',
+  dedupCache: 'verifyDedup',
+};
+
+// Default custom instructions for the web provider. Prepended to the FIRST
+// message of every new Perplexity thread to set the fact-checker's posture.
+const DEFAULT_WEB_CUSTOM_INSTRUCTIONS = [
+  'You are my critical fact-checker for an interview preparation session.',
+  'For every message I send going forward, treat the quoted text as an AI assistant response that needs verification.',
+  'Be extremely strict: flag anything even slightly inaccurate, outdated, or misleading — even if only 1% is wrong.',
+  'Do NOT add new tangential information. Do NOT flag opinions, stylistic choices, or purely conceptual explanations.',
+  'Do NOT mention Perplexity, Sonar, Gemini, ChatGPT, OpenAI, OpenRouter, or any tool/model name in your correction.',
+  '',
+  'Output format — choose exactly one of these two cases:',
+  '  1) If the response is fully accurate, reply with the single word: Accurate.',
+  '  2) If anything is inaccurate, reply with ONE single paragraph in this exact form:',
+  '     "Actually <wrong claim> is wrong — the correct fact is <correct fact> because <brief verifiable reason>."',
+  '     If multiple issues, chain them in the same sentence using ". Also, " between each fact, keeping the same template.',
+  '     End the paragraph with: " Please correct only those points and keep the rest of the explanation unchanged."',
+  'Do not add commentary before or after the paragraph. Do not use Markdown headings or bullet lists.',
+].join('\n');
 
 const MAX_RESPONSE_CHARS = 8000;
 const MAX_CONTEXT_CHARS = 8000;
+const DEDUP_CACHE_MAX = 20;
 
 const SESSION_DEFAULTS = {
   verifications: 0,
@@ -118,14 +172,14 @@ function setSessionVal(values) {
 }
 
 async function getStats() {
-  const data = await getSession('stats');
-  return { ...SESSION_DEFAULTS, ...(data.stats || {}) };
+  const data = await getSession(SESSION_KEYS.stats);
+  return { ...SESSION_DEFAULTS, ...(data[SESSION_KEYS.stats] || {}) };
 }
 
 async function updateStats(patch) {
   const current = await getStats();
   const next = { ...current, ...patch, updatedAt: Date.now() };
-  await setSessionVal({ stats: next });
+  await setSessionVal({ [SESSION_KEYS.stats]: next });
   return next;
 }
 
@@ -141,23 +195,36 @@ async function getSettings() {
     STORAGE_KEYS.apiKey.openrouter,
     STORAGE_KEYS.model,
     STORAGE_KEYS.context,
+    STORAGE_KEYS.webVisible,
+    STORAGE_KEYS.webCustomInstructions,
   ]);
   const provider =
     data[STORAGE_KEYS.provider] && PROVIDERS[data[STORAGE_KEYS.provider]]
       ? data[STORAGE_KEYS.provider]
-      : 'perplexity';
+      : DEFAULT_PROVIDER;
   const providerCfg = PROVIDERS[provider];
   const model =
     data[STORAGE_KEYS.model] &&
     providerCfg.models.some((m) => m.id === data[STORAGE_KEYS.model])
       ? data[STORAGE_KEYS.model]
       : providerCfg.defaultModel;
+  const webVisible =
+    typeof data[STORAGE_KEYS.webVisible] === 'boolean'
+      ? data[STORAGE_KEYS.webVisible]
+      : true;
+  const webCustomInstructions =
+    typeof data[STORAGE_KEYS.webCustomInstructions] === 'string' &&
+    data[STORAGE_KEYS.webCustomInstructions].trim().length > 0
+      ? data[STORAGE_KEYS.webCustomInstructions]
+      : DEFAULT_WEB_CUSTOM_INSTRUCTIONS;
   return {
     provider,
     perplexityKey: data[STORAGE_KEYS.apiKey.perplexity] || '',
     openrouterKey: data[STORAGE_KEYS.apiKey.openrouter] || '',
     model,
     context: data[STORAGE_KEYS.context] || '',
+    webVisible,
+    webCustomInstructions,
   };
 }
 
@@ -299,16 +366,298 @@ function normalizeVerdict(parsed, citations) {
 }
 
 // ---------------------------------------------------------------------------
-// Verify flow
+// Perplexity Web tab management
 // ---------------------------------------------------------------------------
 
-async function handleVerify(payload) {
-  const settings = await getSettings();
+function queryTabs(query) {
+  return new Promise((resolve) =>
+    chrome.tabs.query(query, (tabs) => resolve(tabs || [])),
+  );
+}
+
+function getTab(tabId) {
+  return new Promise((resolve) =>
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError) resolve(null);
+      else resolve(tab || null);
+    }),
+  );
+}
+
+function createTab(options) {
+  return new Promise((resolve) =>
+    chrome.tabs.create(options, (tab) => resolve(tab)),
+  );
+}
+
+function updateTab(tabId, options) {
+  return new Promise((resolve) =>
+    chrome.tabs.update(tabId, options, (tab) => resolve(tab || null)),
+  );
+}
+
+async function isTabAlive(tabId) {
+  if (!tabId) return false;
+  const tab = await getTab(tabId);
+  return !!tab && PERPLEXITY_HOST_RE.test(tab.url || '');
+}
+
+async function getOrCreatePerplexityTab({ visible }) {
+  const session = await getSession([
+    SESSION_KEYS.webThreadTabId,
+    SESSION_KEYS.webThreadSeeded,
+  ]);
+  const cachedId = session[SESSION_KEYS.webThreadTabId];
+  if (cachedId && (await isTabAlive(cachedId))) {
+    if (visible) {
+      await updateTab(cachedId, { active: true });
+    }
+    return { tabId: cachedId, fresh: false, seeded: !!session[SESSION_KEYS.webThreadSeeded] };
+  }
+  // Try to reuse an existing perplexity tab in any window.
+  const existing = await queryTabs({ url: 'https://www.perplexity.ai/*' });
+  let tab = existing[0];
+  if (!tab) {
+    tab = await createTab({
+      url: PERPLEXITY_URL,
+      active: !!visible,
+      pinned: !visible,
+    });
+  } else if (visible) {
+    await updateTab(tab.id, { active: true });
+  }
+  await setSessionVal({
+    [SESSION_KEYS.webThreadTabId]: tab.id,
+    [SESSION_KEYS.webThreadSeeded]: false,
+  });
+  return { tabId: tab.id, fresh: true, seeded: false };
+}
+
+function sendToTab(tabId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, message, (resp) => {
+      if (chrome.runtime.lastError) {
+        resolve({
+          ok: false,
+          error:
+            chrome.runtime.lastError.message ||
+            'No response from Perplexity tab. Reload the tab and retry.',
+        });
+      } else {
+        resolve(resp || { ok: false, error: 'Empty response from content script.' });
+      }
+    });
+  });
+}
+
+async function waitForTabReady(tabId, timeoutMs = 20000) {
+  const start = Date.now();
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const tab = await getTab(tabId);
+    if (!tab) return { ok: false, error: 'Perplexity tab was closed.' };
+    if (tab.status === 'complete') {
+      // Wait one more tick for content script to attach.
+      await new Promise((r) => setTimeout(r, 400));
+      const ping = await sendToTab(tabId, { type: 'PERPLEXITY_PING' });
+      if (ping.ok && ping.hasInput) return { ok: true, ping };
+      if (ping.ok && !ping.loggedIn) {
+        return { ok: false, loggedOut: true, error: 'You are signed out of Perplexity. Sign in and retry.' };
+      }
+    }
+    if (Date.now() - start > timeoutMs) {
+      return { ok: false, error: 'Perplexity tab took too long to load.' };
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
+async function resetPerplexityThread() {
+  await setSessionVal({
+    [SESSION_KEYS.webThreadTabId]: null,
+    [SESSION_KEYS.webThreadSeeded]: false,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Dedup: hash a response so identical text isn't billed twice in a session
+// ---------------------------------------------------------------------------
+
+function hashText(text) {
+  // FNV-1a 32-bit — cheap, dependency-free, collision-resistant enough for
+  // "did the user just verify this exact text in this session".
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+}
+
+async function getDedupCache() {
+  const data = await getSession(SESSION_KEYS.dedupCache);
+  const list = data[SESSION_KEYS.dedupCache];
+  return Array.isArray(list) ? list : [];
+}
+
+async function getCachedVerdict(hash) {
+  const list = await getDedupCache();
+  return list.find((e) => e?.hash === hash) || null;
+}
+
+async function cacheVerdict(hash, verdict) {
+  const list = await getDedupCache();
+  const filtered = list.filter((e) => e?.hash !== hash);
+  filtered.unshift({ hash, verdict, ts: Date.now() });
+  await setSessionVal({
+    [SESSION_KEYS.dedupCache]: filtered.slice(0, DEDUP_CACHE_MAX),
+  });
+}
+
+async function clearDedupCache() {
+  await setSessionVal({ [SESSION_KEYS.dedupCache]: [] });
+}
+
+// ---------------------------------------------------------------------------
+// Parse Perplexity-web natural-language answer into a verdict
+// ---------------------------------------------------------------------------
+
+function parseWebAnswer(answerText) {
+  const trimmed = (answerText || '').trim();
+  if (!trimmed) return null;
+  // Case 1: "Accurate." (or starts with it on its own line)
+  if (/^accurate\.?\s*$/i.test(trimmed)) {
+    return { accurate: true, issues: [], correction: '' };
+  }
+  // First non-empty line / paragraph.
+  const firstLine = trimmed.split(/\n{2,}/)[0].trim();
+  if (/^accurate\.?$/i.test(firstLine)) {
+    return { accurate: true, issues: [], correction: '' };
+  }
+  // Case 2: paragraph starting with "Actually "… our template.
+  const correctionMatch = trimmed.match(/Actually[\s\S]+?(?:Please correct only those points and keep the rest of the explanation unchanged\.?|$)/i);
+  if (correctionMatch) {
+    const correction = correctionMatch[0].trim();
+    // Extract "<wrong claim> is wrong" fragments as the issues list.
+    const issues = [];
+    const re = /Actually\s+(.+?)\s+is wrong/gi;
+    let m;
+    while ((m = re.exec(correction)) !== null) {
+      issues.push(m[1].trim());
+      if (issues.length >= 10) break;
+    }
+    return {
+      accurate: false,
+      issues: issues.length ? issues : ['(see correction)'],
+      correction,
+    };
+  }
+  // Case 3: Perplexity ignored the template — fall back to surfacing the raw
+  // text as the correction but mark it as inaccurate so the user sees it.
+  return {
+    accurate: false,
+    issues: ['Perplexity did not follow the template; raw answer below.'],
+    correction: trimmed,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Verify flow — web provider
+// ---------------------------------------------------------------------------
+
+async function verifyViaPerplexityWeb({ settings, responseText, truncated }) {
+  const { tabId, seeded } = await getOrCreatePerplexityTab({
+    visible: settings.webVisible,
+  });
+  const ready = await waitForTabReady(tabId);
+  if (!ready.ok) return ready;
+
+  const customInstructions =
+    settings.webCustomInstructions || DEFAULT_WEB_CUSTOM_INSTRUCTIONS;
+  const lines = [];
+  if (!seeded) {
+    // First message in this thread — install posture + context.
+    lines.push(customInstructions);
+    lines.push('');
+    if (settings.context && settings.context.trim()) {
+      lines.push('[Interview-prep session context — use this to judge later responses, do NOT fact-check this section]:');
+      lines.push(settings.context.trim());
+      lines.push('');
+    }
+    lines.push('First response to fact-check (verify every claim with web search):');
+  } else {
+    lines.push('Fact-check this AI response per the instructions in the first message of this thread (no preamble, no headings):');
+  }
+  lines.push('---');
+  lines.push(responseText);
+  lines.push('---');
+  if (truncated) {
+    lines.push(`(Note: the response above was truncated to ${MAX_RESPONSE_CHARS} characters.)`);
+  }
+  const prompt = lines.join('\n');
+
+  const out = await sendToTab(tabId, { type: 'PERPLEXITY_ASK', prompt });
+  if (!out.ok) return out;
+
+  if (!seeded) {
+    await setSessionVal({ [SESSION_KEYS.webThreadSeeded]: true });
+  }
+
+  const parsed = parseWebAnswer(out.answer);
+  if (!parsed) {
+    return { ok: false, error: 'Perplexity returned an empty answer.', raw: out.answer };
+  }
+  return {
+    ok: true,
+    verdict: {
+      accurate: parsed.accurate,
+      issues: parsed.issues,
+      correction: parsed.correction,
+      citations: Array.isArray(out.citations) ? out.citations : [],
+      partial: !!out.partial,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Verify flow — API provider (Perplexity direct or OpenRouter)
+// ---------------------------------------------------------------------------
+
+async function verifyViaApi({ settings, responseText, truncated }) {
   const apiKey =
     settings.provider === 'perplexity'
       ? settings.perplexityKey
       : settings.openrouterKey;
+  const userPrompt = buildUserPrompt({
+    context: settings.context,
+    responseText,
+    truncated,
+  });
+  const { content, citations } = await callProvider({
+    provider: settings.provider,
+    apiKey,
+    model: settings.model,
+    system: SYSTEM_PROMPT,
+    user: userPrompt,
+  });
+  const parsed = extractJson(content);
+  const verdict = normalizeVerdict(parsed, citations);
+  if (!verdict) {
+    return {
+      ok: false,
+      error: 'Could not parse a JSON verdict from the provider response.',
+      raw: content,
+    };
+  }
+  return { ok: true, verdict };
+}
 
+// ---------------------------------------------------------------------------
+// Verify flow — dispatcher
+// ---------------------------------------------------------------------------
+
+async function handleVerify(payload) {
+  const settings = await getSettings();
   await updateStats({ lastStatus: 'checking', lastError: null });
 
   const rawText = (payload?.text || '').toString();
@@ -321,36 +670,47 @@ async function handleVerify(payload) {
   const truncated = rawText.length > MAX_RESPONSE_CHARS;
   const responseText = truncated ? rawText.slice(0, MAX_RESPONSE_CHARS) : rawText;
 
-  const userPrompt = buildUserPrompt({
-    context: settings.context,
-    responseText,
-    truncated,
-  });
+  // Dedup: return the cached verdict for byte-identical Claude responses
+  // in the same session unless explicitly forced.
+  const force = !!payload?.force;
+  const dedupHash = hashText(responseText);
+  if (!force) {
+    const cached = await getCachedVerdict(dedupHash);
+    if (cached?.verdict) {
+      await updateStats({
+        lastStatus: cached.verdict.accurate ? 'accurate' : 'inaccurate',
+        lastError: null,
+        lastVerdict: cached.verdict,
+      });
+      return { ok: true, verdict: cached.verdict, fromCache: true };
+    }
+  }
 
   try {
-    const { content, citations } = await callProvider({
-      provider: settings.provider,
-      apiKey,
-      model: settings.model,
-      system: SYSTEM_PROMPT,
-      user: userPrompt,
-    });
-    const parsed = extractJson(content);
-    const verdict = normalizeVerdict(parsed, citations);
-    if (!verdict) {
-      const err = 'Could not parse a JSON verdict from the provider response.';
-      await updateStats({ lastStatus: 'error', lastError: err, lastVerdict: null });
+    const providerCfg = PROVIDERS[settings.provider];
+    if (!providerCfg) {
+      throw new Error(`Unknown provider: ${settings.provider}`);
+    }
+    let result;
+    if (providerCfg.kind === 'web') {
+      result = await verifyViaPerplexityWeb({ settings, responseText, truncated });
+    } else {
+      result = await verifyViaApi({ settings, responseText, truncated });
+    }
+    if (!result.ok) {
+      await updateStats({ lastStatus: 'error', lastError: result.error, lastVerdict: null });
       await bumpStats('errors');
-      return { ok: false, error: err, raw: content };
+      return result;
     }
     await bumpStats('verifications');
-    if (!verdict.accurate) await bumpStats('inaccurate');
+    if (!result.verdict.accurate) await bumpStats('inaccurate');
     await updateStats({
-      lastStatus: verdict.accurate ? 'accurate' : 'inaccurate',
+      lastStatus: result.verdict.accurate ? 'accurate' : 'inaccurate',
       lastError: null,
-      lastVerdict: verdict,
+      lastVerdict: result.verdict,
     });
-    return { ok: true, verdict };
+    await cacheVerdict(dedupHash, result.verdict);
+    return { ok: true, verdict: result.verdict, fromCache: false };
   } catch (err) {
     const msg = err?.message || String(err);
     await updateStats({ lastStatus: 'error', lastError: msg });
@@ -404,6 +764,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             lastStatus: 'idle',
             lastError: null,
           });
+          await clearDedupCache();
           sendResponse({ ok: true });
           return;
         }
@@ -421,8 +782,51 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           if (typeof msg.model === 'string' && msg.model) {
             patch[STORAGE_KEYS.model] = msg.model;
           }
+          if (typeof msg.webVisible === 'boolean') {
+            patch[STORAGE_KEYS.webVisible] = msg.webVisible;
+          }
+          if (typeof msg.webCustomInstructions === 'string') {
+            patch[STORAGE_KEYS.webCustomInstructions] = msg.webCustomInstructions;
+          }
           await setSync(patch);
           sendResponse({ ok: true });
+          return;
+        }
+        case 'OPEN_PERPLEXITY_TAB': {
+          const settings = await getSettings();
+          const { tabId } = await getOrCreatePerplexityTab({
+            visible: settings.webVisible,
+          });
+          await updateTab(tabId, { active: true });
+          sendResponse({ ok: true, tabId });
+          return;
+        }
+        case 'RESET_PERPLEXITY_THREAD': {
+          await resetPerplexityThread();
+          await clearDedupCache();
+          sendResponse({ ok: true });
+          return;
+        }
+        case 'PERPLEXITY_WEB_STATUS': {
+          const session = await getSession([
+            SESSION_KEYS.webThreadTabId,
+            SESSION_KEYS.webThreadSeeded,
+          ]);
+          const tabId = session[SESSION_KEYS.webThreadTabId];
+          let alive = false;
+          let loggedIn = null;
+          if (tabId && (await isTabAlive(tabId))) {
+            alive = true;
+            const ping = await sendToTab(tabId, { type: 'PERPLEXITY_PING' });
+            if (ping.ok) loggedIn = ping.loggedIn;
+          }
+          sendResponse({
+            ok: true,
+            tabId: alive ? tabId : null,
+            alive,
+            loggedIn,
+            seeded: !!session[SESSION_KEYS.webThreadSeeded],
+          });
           return;
         }
         default:
