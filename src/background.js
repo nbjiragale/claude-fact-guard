@@ -1227,9 +1227,28 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           return;
         }
         case 'RESET_PERPLEXITY_THREAD': {
+          // Identify the Perplexity tab BEFORE clearing the cached id
+          // so we can ask it to start a fresh thread visibly. Falls
+          // back to any open perplexity.ai tab if the cached id is
+          // stale or missing.
+          const session = await getSession([SESSION_KEYS.webThreadTabId]);
+          let targetTabId = session[SESSION_KEYS.webThreadTabId];
+          if (!targetTabId || !(await isTabAlive(targetTabId))) {
+            const existing = await queryTabs({ url: 'https://www.perplexity.ai/*' });
+            targetTabId = existing[0]?.id || null;
+          }
           await resetPerplexityThread();
           await clearDedupCache();
-          sendResponse({ ok: true });
+          let newThreadResult = null;
+          if (targetTabId) {
+            newThreadResult = await sendToTab(targetTabId, {
+              type: 'PERPLEXITY_NEW_THREAD',
+            });
+          }
+          sendResponse({
+            ok: true,
+            newThread: newThreadResult || { ok: false, error: 'No live Perplexity tab.' },
+          });
           return;
         }
         case 'PERPLEXITY_WEB_STATUS': {

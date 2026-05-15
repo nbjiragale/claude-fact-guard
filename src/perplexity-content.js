@@ -263,6 +263,64 @@ function getAllAnswerBlocks() {
   return querySelectorAllWithFallback(SELECTORS.answerBlock);
 }
 
+// Locate Perplexity's "+ New thread" sidebar entry. Selectors are
+// ordered from most-specific to most-permissive. We also fall back to
+// a text scan so this keeps working when Perplexity reshuffles their
+// markup. Returns a clickable element or null.
+//
+// Current Perplexity markup (verified 2026-05) is:
+//   <a draggable="false" aria-label="New"
+//      class="reset interactable absolute inset-0 rounded-xl"
+//      href="/"><span></span></a>
+// so the aria-label is literally "New" — not "New thread". The first
+// selector pins that exact shape.
+function findNewThreadControl() {
+  const selectorCandidates = [
+    // Verified current Perplexity sidebar entry.
+    'a[aria-label="New" i][href="/"]',
+    // Variants in case Perplexity tweaks the label.
+    'a[aria-label*="new thread" i]',
+    'a[aria-label="New thread" i]',
+    'button[aria-label="New" i]',
+    'button[aria-label*="new thread" i]',
+    'a[data-testid*="new-thread" i]',
+    'button[data-testid*="new-thread" i]',
+    'a[data-testid*="newthread" i]',
+    'button[data-testid*="newthread" i]',
+    'a[href="/"][aria-label]',
+  ];
+  for (const sel of selectorCandidates) {
+    try {
+      const el = document.querySelector(sel);
+      if (el && el.offsetParent !== null) return el;
+    } catch (_) {
+      /* invalid in some hosts; try next */
+    }
+  }
+  // Text-content scan as a last resort. Restricted to nav / aside /
+  // sidebar containers to avoid accidentally clicking unrelated UI.
+  const containers = Array.from(
+    document.querySelectorAll('nav, aside, [class*="sidebar" i], [data-testid*="sidebar" i]'),
+  );
+  const scopes = containers.length ? containers : [document.body];
+  for (const scope of scopes) {
+    const items = Array.from(scope.querySelectorAll('a, button'));
+    for (const el of items) {
+      if (el.offsetParent === null) continue;
+      const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+      if (!txt) continue;
+      if (
+        txt === 'new thread' ||
+        txt === '+ new thread' ||
+        /^\+?\s*new\s+thread\b/.test(txt)
+      ) {
+        return el;
+      }
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Composer injection
 // ---------------------------------------------------------------------------
@@ -624,12 +682,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           return;
         }
         case 'PERPLEXITY_NEW_THREAD': {
-          // Navigate to a fresh thread. The simplest way is to click the
-          // "New thread" / "Home" entry, but we can also just go to "/" or
-          // "/?fresh=1".
+          // Preferred path: click Perplexity's own "+ New thread" entry
+          // in the sidebar. This is what the user sees and expects —
+          // it preserves the SPA state, login, and any user preferences
+          // tied to the page session. If we can't locate that element
+          // we fall back to navigating the tab to the home route.
           try {
+            const btn = findNewThreadControl();
+            if (btn) {
+              btn.click();
+              sendResponse({ ok: true, method: 'click' });
+              return;
+            }
             location.assign('/');
-            sendResponse({ ok: true });
+            sendResponse({ ok: true, method: 'navigate' });
           } catch (err) {
             sendResponse({ ok: false, error: err?.message || 'Failed to start new thread.' });
           }

@@ -890,3 +890,273 @@ function attachHighlightReapplyObserver() {
   });
   obs.observe(document.body, { subtree: true, childList: true });
 }
+
+// ---------------------------------------------------------------------------
+// Inline "Fact-check" button
+//
+// Renders a small action button on every assistant message so the user
+// can trigger a verification with one click without opening the side
+// panel. The button itself reflects the verdict state:
+//
+//   idle        — "Fact-check"            (clickable)
+//   checking    — "Checking…"             (disabled, spinner)
+//   accurate    — "Accurate"              (green)
+//   inaccurate  — "N issues"              (orange; highlights also painted)
+//   error       — "Error"                 (red; hover for details)
+//
+// Each button reads only its own assistant message's text on click, so
+// the user can fact-check older messages, not just the latest one. The
+// inline highlights still flow through the existing APPLY_HIGHLIGHTS
+// path — the background pushes them to the latest assistant element
+// after each VERIFY.
+//
+// Adheres to SRP: this section knows nothing about highlights, dedup,
+// or providers — it just wires a click to the background's VERIFY
+// message and renders the result on the button.
+// ---------------------------------------------------------------------------
+
+const VERIFY_BTN_CLASS = 'cfg-verify-btn';
+const VERIFY_BTN_ROW_CLASS = 'cfg-verify-row';
+const VERIFY_BTN_ATTACHED_ATTR = 'data-cfg-verify-attached';
+const VERIFY_BTN_STYLE_ID = 'cfg-verify-btn-style';
+
+function ensureVerifyButtonStyles() {
+  if (document.getElementById(VERIFY_BTN_STYLE_ID)) return;
+  const style = document.createElement('style');
+  style.id = VERIFY_BTN_STYLE_ID;
+  style.textContent = `
+    .${VERIFY_BTN_ROW_CLASS} {
+      display: flex;
+      justify-content: flex-end;
+      margin: 8px 0 4px;
+      pointer-events: none;
+    }
+    .${VERIFY_BTN_CLASS} {
+      pointer-events: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      font: 500 12px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      color: #8a7c5e;
+      background: transparent;
+      border: 1px solid rgba(138,124,94,0.35);
+      border-radius: 999px;
+      cursor: pointer;
+      transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease, transform 0.06s ease;
+    }
+    .${VERIFY_BTN_CLASS}:hover {
+      color: #d97757;
+      border-color: #d97757;
+      background: rgba(217,119,87,0.06);
+    }
+    .${VERIFY_BTN_CLASS}:active {
+      transform: translateY(1px);
+    }
+    .${VERIFY_BTN_CLASS}:disabled {
+      cursor: progress;
+      opacity: 0.75;
+    }
+    .${VERIFY_BTN_CLASS} svg {
+      width: 14px;
+      height: 14px;
+      flex: 0 0 14px;
+    }
+    .${VERIFY_BTN_CLASS}[data-cfg-state="checking"] svg {
+      animation: cfg-verify-spin 0.9s linear infinite;
+      transform-origin: 50% 50%;
+    }
+    .${VERIFY_BTN_CLASS}[data-cfg-state="accurate"] {
+      color: #1f7a4d;
+      border-color: rgba(31,122,77,0.5);
+      background: rgba(31,122,77,0.08);
+    }
+    .${VERIFY_BTN_CLASS}[data-cfg-state="inaccurate"] {
+      color: #b94a2b;
+      border-color: rgba(217,119,87,0.55);
+      background: rgba(217,119,87,0.10);
+    }
+    .${VERIFY_BTN_CLASS}[data-cfg-state="error"] {
+      color: #8a2929;
+      border-color: rgba(138,41,41,0.45);
+      background: rgba(138,41,41,0.06);
+    }
+    @media (prefers-color-scheme: dark) {
+      .${VERIFY_BTN_CLASS} {
+        color: #b5a987;
+        border-color: rgba(181,169,135,0.3);
+      }
+      .${VERIFY_BTN_CLASS}:hover {
+        color: #e6916e;
+        border-color: #e6916e;
+        background: rgba(230,145,110,0.10);
+      }
+    }
+    @keyframes cfg-verify-spin {
+      from { transform: rotate(0deg); }
+      to   { transform: rotate(360deg); }
+    }
+  `;
+  document.documentElement.appendChild(style);
+}
+
+function buildVerifyButtonSVG(state) {
+  if (state === 'checking') {
+    // Simple ring spinner.
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3.5-7.1" /></svg>`;
+  }
+  if (state === 'accurate') {
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg>`;
+  }
+  if (state === 'inaccurate') {
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 9v4" /><path d="M12 17h.01" /><path d="M10.3 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" /></svg>`;
+  }
+  if (state === 'error') {
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M15 9l-6 6" /><path d="M9 9l6 6" /></svg>`;
+  }
+  // idle — shield icon.
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" /><path d="m9 12 2 2 4-4" /></svg>`;
+}
+
+function setVerifyBtnState(btn, state, label, title) {
+  if (!btn) return;
+  btn.dataset.cfgState = state;
+  btn.disabled = state === 'checking';
+  const iconSlot = btn.querySelector('.cfg-verify-icon');
+  if (iconSlot) iconSlot.innerHTML = buildVerifyButtonSVG(state);
+  const labelEl = btn.querySelector('.cfg-verify-label');
+  if (labelEl) labelEl.textContent = label;
+  btn.title = title || label;
+  btn.setAttribute('aria-label', `${HOST_LABEL} fact-check: ${label}`);
+}
+
+function attachVerifyButton(messageEl) {
+  if (!messageEl) return;
+  if (messageEl.getAttribute(VERIFY_BTN_ATTACHED_ATTR) === '1') return;
+  // Guard: if a button row is already a child (re-render path), don't
+  // duplicate. The attribute marker is the canonical signal.
+  if (messageEl.querySelector(`.${VERIFY_BTN_ROW_CLASS}`)) {
+    messageEl.setAttribute(VERIFY_BTN_ATTACHED_ATTR, '1');
+    return;
+  }
+  messageEl.setAttribute(VERIFY_BTN_ATTACHED_ATTR, '1');
+
+  const row = document.createElement('div');
+  row.className = VERIFY_BTN_ROW_CLASS;
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = VERIFY_BTN_CLASS;
+  btn.dataset.cfgState = 'idle';
+  btn.innerHTML =
+    `<span class="cfg-verify-icon">${buildVerifyButtonSVG('idle')}</span>` +
+    `<span class="cfg-verify-label">Fact-check</span>`;
+  btn.title = `Fact-check this ${HOST_LABEL} response`;
+  btn.setAttribute('aria-label', `Fact-check this ${HOST_LABEL} response`);
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    runInlineVerify(messageEl, btn);
+  });
+
+  row.appendChild(btn);
+  messageEl.appendChild(row);
+}
+
+function runInlineVerify(messageEl, btn) {
+  // Read only this message's text — not the page latest — so older
+  // messages can also be fact-checked from their own button.
+  let text = '';
+  try {
+    // Exclude the button row itself from innerText.
+    const clone = messageEl.cloneNode(true);
+    clone.querySelectorAll(`.${VERIFY_BTN_ROW_CLASS}`).forEach((n) => n.remove());
+    text = (clone.innerText || '').trim();
+  } catch (_) {
+    text = (messageEl.innerText || '').trim();
+  }
+  if (!text) {
+    setVerifyBtnState(btn, 'error', 'No text', 'This message has no readable text yet.');
+    return;
+  }
+  setVerifyBtnState(btn, 'checking', 'Checking…', 'Fact-checking with your selected provider…');
+  try {
+    chrome.runtime.sendMessage({ type: 'VERIFY', text }, (resp) => {
+      if (chrome.runtime.lastError) {
+        setVerifyBtnState(
+          btn,
+          'error',
+          'Error',
+          chrome.runtime.lastError.message || 'Could not reach background.',
+        );
+        return;
+      }
+      if (!resp || !resp.ok) {
+        setVerifyBtnState(
+          btn,
+          'error',
+          'Error',
+          resp?.error || 'Verification failed.',
+        );
+        return;
+      }
+      const v = resp.verdict || {};
+      if (v.accurate) {
+        setVerifyBtnState(
+          btn,
+          'accurate',
+          resp.fromCache ? 'Accurate (cached)' : 'Accurate',
+          'No factual issues detected. Click to re-verify via the side panel.',
+        );
+      } else {
+        const n = Array.isArray(v.issues) ? v.issues.length : 0;
+        const label = `${n || 1} issue${n === 1 ? '' : 's'}`;
+        setVerifyBtnState(
+          btn,
+          'inaccurate',
+          resp.fromCache ? `${label} (cached)` : label,
+          'Inaccuracies highlighted in the message. Hover a highlight for the correction.',
+        );
+      }
+    });
+  } catch (err) {
+    setVerifyBtnState(
+      btn,
+      'error',
+      'Error',
+      err?.message || String(err),
+    );
+  }
+}
+
+function scanAndAttachVerifyButtons() {
+  ensureVerifyButtonStyles();
+  const messages = querySelectorAllWithFallback(SELECTORS.assistantMessage);
+  for (const msg of messages) attachVerifyButton(msg);
+}
+
+// Debounce scans so Claude's streaming mutations don't thrash this code.
+let verifyBtnScanTimer = null;
+function scheduleVerifyButtonScan() {
+  if (verifyBtnScanTimer) return;
+  verifyBtnScanTimer = setTimeout(() => {
+    verifyBtnScanTimer = null;
+    try {
+      scanAndAttachVerifyButtons();
+    } catch (err) {
+      warn('verify button scan failed', err);
+    }
+  }, 300);
+}
+
+try {
+  const verifyBtnObserver = new MutationObserver(scheduleVerifyButtonScan);
+  verifyBtnObserver.observe(document.body, {
+    subtree: true,
+    childList: true,
+  });
+  // Initial pass.
+  scanAndAttachVerifyButtons();
+} catch (err) {
+  warn('verify button observer failed to attach', err);
+}
