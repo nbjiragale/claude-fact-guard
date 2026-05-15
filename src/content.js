@@ -1,6 +1,7 @@
 // Claude Fact Guard — content script
 //
-// Lives on claude.ai. Listens for messages from the side panel:
+// Lives on the supported AI assistant tabs (claude.ai, chatgpt.com,
+// chat.openai.com). Listens for messages from the side panel:
 //
 //   - GET_LATEST_RESPONSE: returns the text of the latest fully-rendered
 //                          assistant message on the page.
@@ -8,26 +9,66 @@
 //                                 `send` is true, clicks the send button.
 //
 // This script does NOT auto-fact-check anything. Verification is triggered
-// manually from the side panel ("Verify" / "Set Context" buttons).
+// manually from the side panel ("Verify" / "Set Context" buttons) or by
+// the auto-verify observer when the corresponding setting is on.
 //
-// All Claude DOM selectors are declared at the top of this file so they
-// can be patched in one place when Claude's UI changes.
+// All assistant-site DOM selectors live in HOST_ADAPTERS so support for a
+// new host (e.g. Gemini) is purely additive: add an entry there and the
+// rest of this file stays unchanged.
 
-const SELECTORS = {
-  assistantMessage: {
-    primary: '.standard-markdown',
-    fallback: '[data-testid="assistant-message"], .font-claude-message',
+const HOST_ADAPTERS = {
+  // Anthropic Claude — https://claude.ai
+  'claude.ai': {
+    label: 'Claude',
+    assistantMessage: {
+      primary: '.standard-markdown',
+      fallback: '[data-testid="assistant-message"], .font-claude-message',
+    },
+    composerInput: {
+      primary: '[data-testid="chat-input"]',
+      fallback: '[contenteditable="true"][role="textbox"]',
+    },
+    sendButton: {
+      primary: '[data-testid="send-button"]',
+      fallback:
+        'button[aria-label="Send message" i], button[aria-label="Send" i], button[aria-label*="Send message" i]:not([aria-label*="voice" i]), button[type="submit"]',
+    },
   },
-  composerInput: {
-    primary: '[data-testid="chat-input"]',
-    fallback: '[contenteditable="true"][role="textbox"]',
-  },
-  sendButton: {
-    primary: '[data-testid="send-button"]',
-    fallback:
-      'button[aria-label="Send message" i], button[aria-label="Send" i], button[aria-label*="Send message" i]:not([aria-label*="voice" i]), button[type="submit"]',
+  // OpenAI ChatGPT — https://chatgpt.com (legacy chat.openai.com redirects)
+  'chatgpt.com': {
+    label: 'ChatGPT',
+    assistantMessage: {
+      primary: '[data-message-author-role="assistant"]',
+      fallback:
+        'div.markdown.prose, [data-testid^="conversation-turn"] [data-message-author-role="assistant"]',
+    },
+    composerInput: {
+      primary: '#prompt-textarea',
+      fallback:
+        'div[contenteditable="true"][data-virtualkeyboard], textarea#prompt-textarea, textarea[data-testid="prompt-textarea"]',
+    },
+    sendButton: {
+      primary: 'button[data-testid="send-button"]',
+      fallback:
+        'button[data-testid="fruitjuice-send-button"], button[aria-label="Send prompt" i], button[aria-label="Send message" i], form button[type="submit"]',
+    },
   },
 };
+// Aliased hosts that share an adapter.
+HOST_ADAPTERS['chat.openai.com'] = HOST_ADAPTERS['chatgpt.com'];
+
+const HOST_KEY = (() => {
+  const h = (location.hostname || '').toLowerCase();
+  // Strip leading "www." so www.claude.ai matches claude.ai if that ever ships.
+  return h.startsWith('www.') ? h.slice(4) : h;
+})();
+const HOST_ADAPTER = HOST_ADAPTERS[HOST_KEY] || HOST_ADAPTERS['claude.ai'];
+const SELECTORS = {
+  assistantMessage: HOST_ADAPTER.assistantMessage,
+  composerInput: HOST_ADAPTER.composerInput,
+  sendButton: HOST_ADAPTER.sendButton,
+};
+const HOST_LABEL = HOST_ADAPTER.label;
 
 const INJECT_SEND_DELAY_MS = 300;
 const SEND_BUTTON_POLL_INTERVAL_MS = 150;
@@ -69,7 +110,12 @@ function querySelectorAllWithFallback({ primary, fallback }, root = document) {
 
 function getLatestAssistantMessageText() {
   const messages = querySelectorAllWithFallback(SELECTORS.assistantMessage);
-  if (!messages.length) return { ok: false, error: 'No Claude assistant messages found on this page yet.' };
+  if (!messages.length) {
+    return {
+      ok: false,
+      error: `No ${HOST_LABEL} assistant messages found on this page yet.`,
+    };
+  }
   const last = messages[messages.length - 1];
   const text = (last.innerText || '').trim();
   if (!text) {
@@ -84,6 +130,26 @@ function getLatestAssistantMessageText() {
 
 function setComposerText(composer, text) {
   composer.focus();
+
+  // Plain <textarea> path (legacy ChatGPT fallback) — React/Lexical here read
+  // the .value via the prototype setter, so go through it to trigger their
+  // controlled-component change handler.
+  if (composer.tagName === 'TEXTAREA' || composer.tagName === 'INPUT') {
+    try {
+      const proto = Object.getPrototypeOf(composer);
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) {
+        setter.call(composer, text);
+      } else {
+        composer.value = text;
+      }
+    } catch (_) {
+      composer.value = text;
+    }
+    composer.dispatchEvent(new Event('input', { bubbles: true }));
+    composer.dispatchEvent(new Event('change', { bubbles: true }));
+    return;
+  }
 
   // Strategy 1: dispatch a beforeinput event for editors (Tiptap/ProseMirror)
   // that listen for native input events.
@@ -100,16 +166,31 @@ function setComposerText(composer, text) {
   }
 
   // Strategy 2: directly set the editor text and dispatch an input event so
-  // React/Tiptap's synthetic event system picks up the change.
+  // React/Tiptap/ProseMirror's synthetic event system picks up the change.
   while (composer.firstChild) composer.removeChild(composer.firstChild);
-  // Preserve user-friendly line breaks by splitting on \n and adding <br>s.
+  // ProseMirror (used by ChatGPT) renders one <p> per line; mirroring that
+  // is more compatible than raw text nodes inside the editor root.
   const lines = text.split('\n');
-  lines.forEach((line, i) => {
-    composer.appendChild(document.createTextNode(line));
-    if (i < lines.length - 1) {
-      composer.appendChild(document.createElement('br'));
-    }
-  });
+  if (HOST_KEY === 'chatgpt.com' || HOST_KEY === 'chat.openai.com') {
+    lines.forEach((line) => {
+      const p = document.createElement('p');
+      p.textContent = line.length ? line : '';
+      if (!line.length) {
+        const br = document.createElement('br');
+        br.className = 'ProseMirror-trailingBreak';
+        p.appendChild(br);
+      }
+      composer.appendChild(p);
+    });
+  } else {
+    // Claude / generic contenteditable: text nodes with <br> separators.
+    lines.forEach((line, i) => {
+      composer.appendChild(document.createTextNode(line));
+      if (i < lines.length - 1) {
+        composer.appendChild(document.createElement('br'));
+      }
+    });
+  }
 
   composer.dispatchEvent(
     new InputEvent('input', {
@@ -171,7 +252,10 @@ function pollAndClickSend(composer, startedAt) {
 function injectText(text, { send }) {
   const composer = querySelectorWithFallback(SELECTORS.composerInput);
   if (!composer) {
-    return { ok: false, error: 'Claude composer not found. Is the chat thread open?' };
+    return {
+      ok: false,
+      error: `${HOST_LABEL} composer not found. Is the chat thread open?`,
+    };
   }
   setComposerText(composer, text);
 
@@ -232,7 +316,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true;
 });
 
-log('Claude Fact Guard content script attached');
+log('Claude Fact Guard content script attached', { host: HOST_KEY, label: HOST_LABEL });
 
 // ---------------------------------------------------------------------------
 // Auto-verify observer

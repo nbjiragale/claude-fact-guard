@@ -60,8 +60,11 @@
     </header>
 
     <p class="tab-warning" id="tab-warning" hidden>
-      Open <a href="https://claude.ai" target="_blank" rel="noreferrer noopener">claude.ai</a>
-      in the current tab — this panel only works there.
+      Open
+      <a href="https://claude.ai" target="_blank" rel="noreferrer noopener">claude.ai</a>
+      or
+      <a href="https://chatgpt.com" target="_blank" rel="noreferrer noopener">chatgpt.com</a>
+      in the current tab — this panel only works on supported AI chats.
     </p>
 
     <!-- ===================== HOME VIEW ===================== -->
@@ -69,7 +72,7 @@
       <section class="card verify">
         <div class="card-body">
           <button class="primary big" id="verify-btn">
-            Verify latest Claude response
+            Verify latest AI response
           </button>
           <button class="ghost small" id="reverify-btn" type="button" hidden>
             Re-verify (force, will use a new Pro search)
@@ -96,7 +99,7 @@
           </div>
 
           <div id="correction-block" hidden>
-            <h3>Correction to paste into Claude</h3>
+            <h3>Correction to paste back into the chat</h3>
             <pre id="correction-text"></pre>
             <div class="button-row">
               <button class="primary" id="paste-correction">Paste</button>
@@ -207,10 +210,11 @@
           <div class="field auto-verify-field">
             <label class="toggle-row">
               <span class="toggle-main">
-                <span class="toggle-title">Auto-verify Claude responses</span>
+                <span class="toggle-title">Auto-verify AI responses</span>
                 <span class="toggle-sub">
-                  Verify every new Claude reply in the background. Perplexity
-                  is forced hidden / pinned so your focus stays on Claude.
+                  Verify every new Claude / ChatGPT reply in the background.
+                  Perplexity is forced hidden / pinned so your focus stays on
+                  the chat.
                 </span>
               </span>
               <span class="toggle">
@@ -223,11 +227,11 @@
           <div class="field auto-verify-field">
             <label class="toggle-row">
               <span class="toggle-main">
-                <span class="toggle-title">Inline corrections in Claude</span>
+                <span class="toggle-title">Inline corrections in the chat</span>
                 <span class="toggle-sub">
-                  Highlight wrong claims directly in Claude's reply with a
-                  hover popover (Grammarly-style). Side-panel verdict is
-                  still shown as a backup view.
+                  Highlight wrong claims directly in the AI's reply (Claude or
+                  ChatGPT) with a hover popover (Grammarly-style). Side-panel
+                  verdict is still shown as a backup view.
                 </span>
               </span>
               <span class="toggle">

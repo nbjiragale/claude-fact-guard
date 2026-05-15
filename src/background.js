@@ -955,13 +955,23 @@ async function verifyViaApi({ settings, responseText, truncated }) {
 // The user explicitly chose skip-over-queue behaviour for option (b).
 let autoVerifyInFlight = false;
 
-// Find the most recently focused claude.ai tab and ask its content script
-// to apply (or clear) inline highlights for this verdict. Best-effort: if
-// no Claude tab is open, or if the tab hasn't loaded the content script
-// yet, silently no-op. The side panel remains the canonical surface.
-async function pushHighlightsToClaudeTab(verdict, responseText) {
+// URL patterns for every AI assistant host the extension supports. Kept in
+// sync with manifest.json content_scripts.matches and HOST_ADAPTERS in
+// content.js — adding a new assistant means appending here too.
+const AI_TAB_URL_PATTERNS = [
+  'https://claude.ai/*',
+  'https://chatgpt.com/*',
+  'https://chat.openai.com/*',
+];
+
+// Find the most recently focused AI assistant tab (Claude or ChatGPT) and
+// ask its content script to apply (or clear) inline highlights for this
+// verdict. Best-effort: if no supported tab is open, or the tab hasn't
+// loaded the content script yet, silently no-op. The side panel remains
+// the canonical surface.
+async function pushHighlightsToAITab(verdict, responseText) {
   if (!verdict) return;
-  const tabs = await queryTabs({ url: 'https://claude.ai/*' });
+  const tabs = await queryTabs({ url: AI_TAB_URL_PATTERNS });
   if (!tabs.length) return;
   // Prefer the active tab if there is one, else the most recently used.
   const sorted = tabs.slice().sort((a, b) => {
@@ -1001,7 +1011,7 @@ async function handleVerify(payload) {
 
   const rawText = (payload?.text || '').toString();
   if (!rawText.trim()) {
-    const err = 'No assistant response text found to verify. Open Claude.ai and wait for an answer first.';
+    const err = 'No assistant response text found to verify. Open Claude or ChatGPT and wait for an answer first.';
     await updateStats({ lastStatus: 'error', lastError: err });
     await bumpStats('errors');
     return { ok: false, error: err };
@@ -1022,7 +1032,7 @@ async function handleVerify(payload) {
         lastVerdict: cached.verdict,
       });
       if (settings.inlineHighlights) {
-        pushHighlightsToClaudeTab(cached.verdict, responseText).catch(() => {});
+        pushHighlightsToAITab(cached.verdict, responseText).catch(() => {});
       }
       return { ok: true, verdict: cached.verdict, fromCache: true };
     }
@@ -1053,7 +1063,7 @@ async function handleVerify(payload) {
     });
     await cacheVerdict(dedupHash, result.verdict);
     if (settings.inlineHighlights) {
-      pushHighlightsToClaudeTab(result.verdict, responseText).catch(() => {});
+      pushHighlightsToAITab(result.verdict, responseText).catch(() => {});
     }
     return { ok: true, verdict: result.verdict, fromCache: false };
   } catch (err) {

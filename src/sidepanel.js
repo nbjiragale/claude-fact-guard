@@ -139,7 +139,12 @@ function sendBg(message) {
   });
 }
 
-async function getActiveClaudeTab() {
+// URL patterns for every supported AI assistant tab. Adding a new host
+// (e.g. Gemini) means: 1) update HOST_ADAPTERS in content.js, 2) update
+// AI_TAB_URL_PATTERNS in background.js, 3) extend this regex below.
+const AI_TAB_URL_REGEX = /^https:\/\/(claude\.ai|chatgpt\.com|chat\.openai\.com)\//;
+
+async function getActiveAITab() {
   const tabs = await new Promise((resolve) =>
     chrome.tabs.query({ active: true, currentWindow: true }, (t) =>
       resolve(t || []),
@@ -147,8 +152,11 @@ async function getActiveClaudeTab() {
   );
   const tab = tabs[0];
   if (!tab) return { ok: false, error: 'No active tab.' };
-  if (!/^https:\/\/claude\.ai\//.test(tab.url || '')) {
-    return { ok: false, error: 'The current tab is not claude.ai.' };
+  if (!AI_TAB_URL_REGEX.test(tab.url || '')) {
+    return {
+      ok: false,
+      error: 'The current tab is not Claude.ai or ChatGPT.com.',
+    };
   }
   return { ok: true, tab };
 }
@@ -161,7 +169,7 @@ function sendTab(tabId, message) {
           ok: false,
           error:
             chrome.runtime.lastError.message ||
-            'Cannot reach the claude.ai tab.',
+            'Cannot reach the AI assistant tab.',
         });
       } else {
         resolve(resp || { ok: false, error: 'No response from content script.' });
@@ -445,12 +453,12 @@ els.inlineHighlightsToggle?.addEventListener('change', async () => {
   const next = els.inlineHighlightsToggle.checked;
   state.settings.inlineHighlights = next;
   await sendBg({ type: 'SAVE_SETTINGS', inlineHighlights: next });
-  // If user turned the feature off, ask Claude's content script to tear
-  // down any highlights currently rendered.
+  // If user turned the feature off, ask the active AI tab's content script
+  // to tear down any highlights currently rendered.
   if (!next) {
-    const claude = await getActiveClaudeTab();
-    if (claude.ok) {
-      await sendTab(claude.tab.id, { type: 'CLEAR_HIGHLIGHTS' });
+    const aiTab = await getActiveAITab();
+    if (aiTab.ok) {
+      await sendTab(aiTab.tab.id, { type: 'CLEAR_HIGHLIGHTS' });
     }
   }
 });
@@ -503,7 +511,7 @@ async function runVerify({ force }) {
   els.statusLabel.textContent = STATUS_LABELS.checking;
 
   try {
-    const tabResp = await getActiveClaudeTab();
+    const tabResp = await getActiveAITab();
     if (!tabResp.ok) {
       els.statusDot.className = 'status-dot error';
       els.statusLabel.textContent = STATUS_LABELS.error;
@@ -517,7 +525,7 @@ async function runVerify({ force }) {
       els.statusDot.className = 'status-dot error';
       els.statusLabel.textContent = STATUS_LABELS.error;
       els.statusError.hidden = false;
-      els.statusError.textContent = latest.error || 'Could not read Claude response.';
+      els.statusError.textContent = latest.error || 'Could not read the assistant response.';
       return;
     }
 
@@ -546,7 +554,7 @@ els.reverifyBtn.addEventListener('click', () => runVerify({ force: true }));
 async function injectCorrection(send) {
   const text = (els.correctionText.textContent || '').trim();
   if (!text) return;
-  const tabResp = await getActiveClaudeTab();
+  const tabResp = await getActiveAITab();
   if (!tabResp.ok) {
     els.statusError.hidden = false;
     els.statusError.textContent = tabResp.error;
@@ -630,7 +638,7 @@ function startWebStatusPolling() {
 }
 
 async function updateTabWarning() {
-  const tabResp = await getActiveClaudeTab();
+  const tabResp = await getActiveAITab();
   els.tabWarning.hidden = tabResp.ok;
 }
 
