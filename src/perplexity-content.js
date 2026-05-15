@@ -287,7 +287,7 @@ function readLatestAnswer() {
     citations.push(href);
     if (citations.length >= 20) break;
   }
-  return { text, citations };
+  return { answer: text, citations };
 }
 
 /**
