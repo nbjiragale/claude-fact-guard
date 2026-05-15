@@ -107,30 +107,38 @@ const DEFAULT_WEB_CUSTOM_INSTRUCTIONS = [
   '  • conceptual or pedagogical explanations',
   '  • code that is functionally correct even if not idiomatic',
   '  • paraphrasing differences when the substance is right',
+  '  • less detail than your sources provide — if the claim is correct but shorter, that is ACCURATE',
+  '  • "unsupported wording" or missing citations in the original — if the substance is correct, that is ACCURATE',
+  '  • anything you cannot find an authoritative source explicitly contradicting',
   '',
   'STRICTNESS',
-  'Flag anything even 1% off, outdated, or misleading. If sources are mixed or ambiguous, treat that as inaccurate and say so explicitly.',
+  'Default to ACCURATE. Only mark INACCURATE when you find authoritative sources that EXPLICITLY contradict a specific factual claim in the response (wrong date, wrong number, wrong version, wrong name, wrong definition, wrong API behavior). Mixed or ambiguous sources — mark ACCURATE and move on, do NOT flag. "Could be more detailed" — ACCURATE. "Source does not explicitly say this exact phrase" — ACCURATE (so long as substance is correct).',
   '',
-  'OUTPUT — choose exactly one form, nothing else:',
+  'OUTPUT — choose exactly one form, nothing else. The FIRST LINE must be a single word verdict label, uppercase, no punctuation:',
   '',
-  '  (A) If fully accurate:',
-  '        Accurate.',
+  '  (A) If the response is correct in substance (even if your sources are more detailed):',
+  '        ACCURATE',
+  '        <one short sentence describing what you verified, no markdown>',
   '',
-  '  (B) If anything is inaccurate, one paragraph in this exact form:',
+  '  (B) If you found at least one authoritative source that explicitly contradicts a factual claim:',
+  '        INACCURATE',
   '        Actually <wrong claim> is wrong — the correct fact is <correct fact> because <brief verifiable reason> [n].',
   '      • Cite at least one source [n] for every claim.',
   '      • For multiple issues, chain with ". Also, " using the same template for each issue.',
   '      • End with: " Please correct only those points and keep the rest of the explanation unchanged."',
   '',
   'EXAMPLES',
-  '  Accurate.',
+  '  ACCURATE',
+  '  Siddaramaiah is the current CM of Karnataka, sworn in May 20 2023, INC, MLA from Varuna — all substantive claims verified [1][2].',
   '',
+  '  INACCURATE',
   '  Actually Python 3.11 being the current LTS is wrong — the correct fact is that Python has no LTS designation and 3.12 is the current stable line as of Oct 2023 [1]. Also, Spring Boot 3.0 supporting Java 8 is wrong — the correct fact is Spring Boot 3.x requires Java 17+ because the baseline was bumped in the 3.0 release [2]. Please correct only those points and keep the rest of the explanation unchanged.',
   '',
   'FORBIDDEN',
   '  • Do not mention Perplexity, Sonar, Gemini, ChatGPT, OpenAI, OpenRouter, or any tool/model name in the output.',
-  '  • No markdown headings or bullets in the output, only the one paragraph (or the single word "Accurate.").',
-  '  • No preamble, no postamble.',
+  '  • No markdown headings or bullets in the output.',
+  '  • No preamble, no postamble, no extra commentary outside the format above.',
+  '  • Never write INACCURATE for a claim that is factually correct but less detailed or differently phrased. Substance only.',
 ].join('\n');
 
 const MAX_RESPONSE_CHARS = 8000;
@@ -215,6 +223,28 @@ async function bumpStats(field) {
   return updateStats({ [field]: (current[field] || 0) + 1 });
 }
 
+// If the user previously clicked "Save settings" while a now-superseded
+// managed default was in the custom-instructions textarea, their storage holds
+// a stale prompt that overrides our new default. Detect those and migrate so
+// every new release ships the latest fact-checker posture without forcing the
+// user to manually reset.
+function isLegacyManagedDefault(saved) {
+  if (!saved || typeof saved !== 'string') return false;
+  // Pre-3.1 free-form default.
+  if (saved.includes('critical fact-checker for an interview preparation session')) {
+    return true;
+  }
+  // 3.1.0 structured default (no ACCURATE/INACCURATE first-line label, no
+  // "less detail than your sources provide" SCOPE bullet).
+  if (
+    saved.includes('You are my strict fact-checker. I will paste AI assistant responses') &&
+    !saved.includes('less detail than your sources provide')
+  ) {
+    return true;
+  }
+  return false;
+}
+
 async function getSettings() {
   const data = await getSync([
     STORAGE_KEYS.provider,
@@ -225,6 +255,12 @@ async function getSettings() {
     STORAGE_KEYS.webVisible,
     STORAGE_KEYS.webCustomInstructions,
   ]);
+  if (isLegacyManagedDefault(data[STORAGE_KEYS.webCustomInstructions])) {
+    // Clear the stale stored value so the new default applies. Fire-and-forget
+    // — we don't await because the override below already uses the fresh value.
+    setSync({ [STORAGE_KEYS.webCustomInstructions]: '' }).catch(() => {});
+    data[STORAGE_KEYS.webCustomInstructions] = '';
+  }
   const provider =
     data[STORAGE_KEYS.provider] && PROVIDERS[data[STORAGE_KEYS.provider]]
       ? data[STORAGE_KEYS.provider]
@@ -286,7 +322,8 @@ const SYSTEM_PROMPT = [
   '  "correction": string',
   '}',
   '',
-  'If fully accurate: accurate=true, issues=[], correction="".',
+  'DEFAULT TO accurate=true. Only set accurate=false when you found authoritative sources that EXPLICITLY contradict a specific factual claim. Mixed or ambiguous sources — accurate=true. Less detailed than your sources — accurate=true. "Unsupported wording" — accurate=true.',
+  'If accurate: accurate=true, issues=[], correction="".',
   'If inaccurate: accurate=false, list each specific factual error in "issues", and set "correction" to ONE single paragraph the user can paste back, in this exact form:',
   '  "Actually <wrong claim> is wrong — the correct fact is <correct fact> because <brief verifiable reason>."',
   'For multiple issues, chain in the same paragraph using ". Also, " between each fact, repeating the same "Actually … is wrong — the correct fact is … because …" template for every issue.',
@@ -574,39 +611,90 @@ async function clearDedupCache() {
 function parseWebAnswer(answerText) {
   const trimmed = (answerText || '').trim();
   if (!trimmed) return null;
-  // Case 1: "Accurate." (or starts with it on its own line)
+
+  // Normalize the first non-empty line. The new contract is: first line is a
+  // single-word verdict label, uppercase (ACCURATE / INACCURATE), then the
+  // explanation. We are lenient — strip leading markdown / punctuation, accept
+  // case-insensitive, accept legacy "Accurate." as the entire reply.
+  const lines = trimmed.split(/\r?\n/);
+  let firstLine = '';
+  let rest = '';
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i].trim();
+    if (!ln) continue;
+    firstLine = ln;
+    rest = lines.slice(i + 1).join('\n').trim();
+    break;
+  }
+  const firstToken = firstLine
+    .replace(/^[#>*\-\u2022\s\"'\(\[]+/, '') // strip markdown/punct prefix
+    .replace(/[.,:;!?\s\"'\)\]]+$/, '')        // strip trailing punct
+    .trim()
+    .toLowerCase();
+
+  if (firstToken === 'accurate' || firstToken === 'verified') {
+    // Accurate verdict. Anything after the first line is treated as a short
+    // verification note — surface it via correction so the user can see what
+    // sources Perplexity actually checked, but keep accurate=true.
+    return {
+      accurate: true,
+      issues: [],
+      correction: rest || '',
+    };
+  }
+
+  if (firstToken === 'inaccurate' || firstToken === 'incorrect' || firstToken === 'wrong') {
+    return extractInaccurate(rest || trimmed, /* haveExplicitLabel */ true);
+  }
+
+  // Backward-compat: legacy responses without the explicit first-line label.
+  // If the whole answer is just "Accurate." treat it as accurate.
   if (/^accurate\.?\s*$/i.test(trimmed)) {
     return { accurate: true, issues: [], correction: '' };
   }
-  // First non-empty line / paragraph.
-  const firstLine = trimmed.split(/\n{2,}/)[0].trim();
-  if (/^accurate\.?$/i.test(firstLine)) {
+  // Or if the first paragraph alone is "Accurate.".
+  const firstPara = trimmed.split(/\n{2,}/)[0].trim();
+  if (/^accurate\.?$/i.test(firstPara)) {
     return { accurate: true, issues: [], correction: '' };
   }
-  // Case 2: paragraph starting with "Actually "… our template.
-  const correctionMatch = trimmed.match(/Actually[\s\S]+?(?:Please correct only those points and keep the rest of the explanation unchanged\.?|$)/i);
-  if (correctionMatch) {
-    const correction = correctionMatch[0].trim();
-    // Extract "<wrong claim> is wrong" fragments as the issues list.
-    const issues = [];
-    const re = /Actually\s+(.+?)\s+is wrong/gi;
-    let m;
-    while ((m = re.exec(correction)) !== null) {
-      issues.push(m[1].trim());
-      if (issues.length >= 10) break;
-    }
-    return {
-      accurate: false,
-      issues: issues.length ? issues : ['(see correction)'],
-      correction,
-    };
+
+  // Legacy: paragraph starting with "Actually … is wrong".
+  if (/Actually[\s\S]+?is wrong/i.test(trimmed)) {
+    return extractInaccurate(trimmed, /* haveExplicitLabel */ false);
   }
-  // Case 3: Perplexity ignored the template — fall back to surfacing the raw
-  // text as the correction but mark it as inaccurate so the user sees it.
+
+  // Unparseable — surface raw text but be honest that we couldn't classify.
+  // Default to ACCURATE so we don't mislabel a likely-accurate answer just
+  // because the model went off-format.
+  return {
+    accurate: true,
+    issues: [],
+    correction: trimmed,
+  };
+}
+
+function extractInaccurate(body, haveExplicitLabel) {
+  const text = (body || '').trim();
+  // Prefer the literal "Actually … Please correct only those points…"
+  // paragraph if it's there. Otherwise just use the whole body.
+  const match = text.match(/Actually[\s\S]+?(?:Please correct only those points and keep the rest of the explanation unchanged\.?|$)/i);
+  const correction = match ? match[0].trim() : text;
+
+  const issues = [];
+  const re = /Actually\s+(.+?)\s+is wrong/gi;
+  let m;
+  while ((m = re.exec(correction)) !== null) {
+    issues.push(m[1].trim());
+    if (issues.length >= 10) break;
+  }
   return {
     accurate: false,
-    issues: ['Perplexity did not follow the template; raw answer below.'],
-    correction: trimmed,
+    issues: issues.length
+      ? issues
+      : haveExplicitLabel
+        ? ['(see correction)']
+        : ['Perplexity did not follow the template; raw answer below.'],
+    correction,
   };
 }
 
