@@ -79,6 +79,8 @@ const STORAGE_KEYS = {
   // perplexity-web only
   webVisible: 'perplexityWebVisible',
   webCustomInstructions: 'perplexityWebCustomInstructions',
+  // auto-verify
+  autoVerify: 'autoVerify',
 };
 
 const SESSION_KEYS = {
@@ -280,6 +282,7 @@ async function getSettings() {
     data[STORAGE_KEYS.webCustomInstructions].trim().length > 0
       ? data[STORAGE_KEYS.webCustomInstructions]
       : DEFAULT_WEB_CUSTOM_INSTRUCTIONS;
+  const autoVerify = data[STORAGE_KEYS.autoVerify] === true;
   return {
     provider,
     perplexityKey: data[STORAGE_KEYS.apiKey.perplexity] || '',
@@ -288,7 +291,15 @@ async function getSettings() {
     context: data[STORAGE_KEYS.context] || '',
     webVisible,
     webCustomInstructions,
+    autoVerify,
   };
+}
+
+// Re-load the autoVerify flag on its own. The settings storage key is in
+// chrome.storage.sync, but reads through getSettings hit too many other keys.
+async function loadAutoVerifyFlag() {
+  const data = await getSync([STORAGE_KEYS.autoVerify]);
+  return data[STORAGE_KEYS.autoVerify] === true;
 }
 
 // ---------------------------------------------------------------------------
@@ -817,8 +828,19 @@ async function verifyViaApi({ settings, responseText, truncated }) {
 // Verify flow — dispatcher
 // ---------------------------------------------------------------------------
 
+// Single-flight guard for auto-verifies. Prevents the second of two
+// back-to-back Claude responses from interrupting an in-flight verify.
+// The user explicitly chose skip-over-queue behaviour for option (b).
+let autoVerifyInFlight = false;
+
 async function handleVerify(payload) {
   const settings = await getSettings();
+  if (payload?.auto) {
+    // Auto-verify always uses a hidden, pinned Perplexity tab so the
+    // user's focus stays on Claude. This overrides the saved webVisible
+    // setting for this one call only.
+    settings.webVisible = false;
+  }
   await updateStats({ lastStatus: 'checking', lastError: null });
 
   const rawText = (payload?.text || '').toString();
@@ -949,8 +971,36 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           if (typeof msg.webCustomInstructions === 'string') {
             patch[STORAGE_KEYS.webCustomInstructions] = msg.webCustomInstructions;
           }
+          if (typeof msg.autoVerify === 'boolean') {
+            patch[STORAGE_KEYS.autoVerify] = msg.autoVerify;
+          }
           await setSync(patch);
           sendResponse({ ok: true });
+          return;
+        }
+        case 'CLAUDE_RESPONSE_COMPLETE': {
+          // Fired by the Claude content script when an assistant response has
+          // finished streaming. Run a hidden auto-verify only if the setting is
+          // on. Skip if another verify is already in flight.
+          const enabled = await loadAutoVerifyFlag();
+          if (!enabled) {
+            sendResponse({ ok: true, skipped: 'auto-verify-disabled' });
+            return;
+          }
+          if (autoVerifyInFlight) {
+            sendResponse({ ok: true, skipped: 'verify-in-flight' });
+            return;
+          }
+          autoVerifyInFlight = true;
+          try {
+            const out = await handleVerify({
+              text: (msg.text || '').toString(),
+              auto: true,
+            });
+            sendResponse(out);
+          } finally {
+            autoVerifyInFlight = false;
+          }
           return;
         }
         case 'OPEN_PERPLEXITY_TAB': {

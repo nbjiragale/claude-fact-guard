@@ -53,6 +53,7 @@ const els = {
   webCustomInstructions: document.getElementById('web-custom-instructions'),
   resetWebInstructions: document.getElementById('reset-web-instructions'),
   resetThread: document.getElementById('reset-thread'),
+  autoVerifyToggle: document.getElementById('auto-verify-toggle'),
 
   // Session context (Settings view)
   contextInput: document.getElementById('context-input'),
@@ -193,6 +194,9 @@ function renderProviderUI() {
       els.webCustomInstructions.value !== settings.webCustomInstructions
     ) {
       els.webCustomInstructions.value = settings.webCustomInstructions || '';
+    }
+    if (els.autoVerifyToggle) {
+      els.autoVerifyToggle.checked = !!settings.autoVerify;
     }
   } else {
     const stored =
@@ -422,6 +426,15 @@ els.contextInput.addEventListener('input', () => {
   state.settings.context = els.contextInput.value;
 });
 
+els.autoVerifyToggle?.addEventListener('change', async () => {
+  if (!state.settings) return;
+  const next = els.autoVerifyToggle.checked;
+  state.settings.autoVerify = next;
+  // Persist immediately so the content script picks up the change without
+  // requiring the user to click "Save settings".
+  await sendBg({ type: 'SAVE_SETTINGS', autoVerify: next });
+});
+
 els.saveSettings.addEventListener('click', async () => {
   flash(els.saveSettings, 'Saving…', true);
   const [settingsResp, contextResp] = await Promise.all([
@@ -433,6 +446,7 @@ els.saveSettings.addEventListener('click', async () => {
       model: state.settings.model,
       webVisible: state.settings.webVisible,
       webCustomInstructions: state.settings.webCustomInstructions,
+      autoVerify: !!state.settings.autoVerify,
     }),
     sendBg({
       type: 'SET_CONTEXT',

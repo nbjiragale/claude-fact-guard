@@ -215,3 +215,117 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 log('Claude Fact Guard content script attached');
+
+// ---------------------------------------------------------------------------
+// Auto-verify observer
+//
+// When the "Auto-verify Claude responses" setting is on, watch for new
+// assistant messages and notify the background once a message has stopped
+// streaming. The background applies the dedup cache and runs the same
+// Verify flow it would run on a manual click — except the Perplexity tab
+// is forced hidden so the user's focus stays on Claude.
+//
+// Detection strategy: a MutationObserver coalesces DOM activity onto a
+// debounced "quiet timer". When the last assistant message has been
+// unchanged for AUTO_VERIFY_QUIET_MS we treat streaming as finished and
+// send CLAUDE_RESPONSE_COMPLETE exactly once per unique response.
+// ---------------------------------------------------------------------------
+
+const AUTO_VERIFY_QUIET_MS = 2500;
+const AUTO_VERIFY_MIN_CHARS = 40;
+const AUTO_VERIFY_COALESCE_MS = 250;
+
+let autoVerifyEnabled = false;
+let autoVerifyCoalesceTimer = null;
+let autoVerifyQuietTimer = null;
+let autoVerifyLastHash = '';
+
+function fnv1a32(text) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) | 0;
+  }
+  return ('0000000' + (h >>> 0).toString(16)).slice(-8);
+}
+
+function pickupLatestAssistantText() {
+  const r = getLatestAssistantMessageText();
+  return r.ok ? r.text : null;
+}
+
+function evaluateAutoVerify() {
+  if (!autoVerifyEnabled) return;
+  const text = pickupLatestAssistantText();
+  if (!text || text.length < AUTO_VERIFY_MIN_CHARS) return;
+  const hash = fnv1a32(text);
+  if (hash === autoVerifyLastHash) return;
+  if (autoVerifyQuietTimer) clearTimeout(autoVerifyQuietTimer);
+  autoVerifyQuietTimer = setTimeout(() => {
+    autoVerifyQuietTimer = null;
+    const fresh = pickupLatestAssistantText();
+    if (!fresh) return;
+    const freshHash = fnv1a32(fresh);
+    if (freshHash !== hash) {
+      // Streaming still going — re-arm via the next mutation.
+      return;
+    }
+    if (freshHash === autoVerifyLastHash) return;
+    autoVerifyLastHash = freshHash;
+    log('auto-verify firing for hash', freshHash, 'len', fresh.length);
+    try {
+      chrome.runtime.sendMessage(
+        { type: 'CLAUDE_RESPONSE_COMPLETE', text: fresh },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            warn('auto-verify send failed', chrome.runtime.lastError.message);
+          } else {
+            log('auto-verify response', resp);
+          }
+        },
+      );
+    } catch (err) {
+      warn('auto-verify dispatch failed', err);
+    }
+  }, AUTO_VERIFY_QUIET_MS);
+}
+
+function onAutoVerifyMutation() {
+  if (!autoVerifyEnabled) return;
+  if (autoVerifyCoalesceTimer) return;
+  autoVerifyCoalesceTimer = setTimeout(() => {
+    autoVerifyCoalesceTimer = null;
+    evaluateAutoVerify();
+  }, AUTO_VERIFY_COALESCE_MS);
+}
+
+try {
+  const autoVerifyObserver = new MutationObserver(onAutoVerifyMutation);
+  autoVerifyObserver.observe(document.body, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+  });
+} catch (err) {
+  warn('auto-verify observer failed to attach', err);
+}
+
+try {
+  chrome.storage.sync.get(['autoVerify'], (data) => {
+    autoVerifyEnabled = !!(data && data.autoVerify);
+    log('auto-verify initial state:', autoVerifyEnabled);
+    if (autoVerifyEnabled) evaluateAutoVerify();
+  });
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'sync' || !changes || !('autoVerify' in changes)) return;
+    autoVerifyEnabled = !!changes.autoVerify.newValue;
+    log('auto-verify toggled:', autoVerifyEnabled);
+    if (autoVerifyEnabled) {
+      // Re-evaluate immediately so an already-complete response gets caught.
+      autoVerifyLastHash = '';
+      evaluateAutoVerify();
+    }
+  });
+} catch (err) {
+  warn('failed to subscribe to autoVerify setting', err);
+}
