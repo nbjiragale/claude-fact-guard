@@ -15,15 +15,33 @@
 
 const SELECTORS = {
   // The main "Ask anything" composer on the Home / Thread pages.
+  // As of late-2024 Perplexity ships a Lexical contenteditable on Home and a
+  // separate one for follow-ups; both are caught here.
   composer: {
-    primary: 'textarea[placeholder*="Ask" i], textarea[placeholder*="follow-up" i]',
-    fallback:
-      'textarea, [contenteditable="true"][role="textbox"], div[contenteditable="true"]',
+    primary: [
+      'textarea[placeholder*="Ask" i]',
+      'textarea[placeholder*="follow-up" i]',
+      'textarea[placeholder*="Ask anything" i]',
+      'div[contenteditable="true"][role="textbox"]',
+      'div[data-lexical-editor="true"]',
+      'div[contenteditable="true"][aria-label*="Ask" i]',
+      'div[contenteditable="true"][aria-label*="follow-up" i]',
+    ].join(', '),
+    fallback: [
+      'textarea',
+      '[contenteditable="true"][role="textbox"]',
+      '[contenteditable="true"]',
+      'div[contenteditable="true"]',
+    ].join(', '),
   },
   // Send / submit button (paper-plane / arrow icon).
   sendButton: {
-    primary:
-      'button[aria-label*="Submit" i], button[aria-label*="Send" i], button[data-testid*="submit" i]',
+    primary: [
+      'button[aria-label*="Submit" i]',
+      'button[aria-label*="Send" i]',
+      'button[data-testid*="submit" i]',
+      'button[data-testid*="send" i]',
+    ].join(', '),
     fallback: 'button[type="submit"]',
   },
   // The container for the latest assistant answer block.
@@ -47,12 +65,30 @@ const SELECTORS = {
     fallback: 'a[href^="http"][rel*="noreferrer" i]',
   },
   // The login / "Sign in" gate. Presence => the user is logged out.
+  // NOTE: legacy fallback used jQuery-style `:contains()` which is not a
+  // valid CSS selector; querySelector throws on it. We catch the throw but
+  // it added noise to the console — use a CSS-valid fallback instead.
   loginGate: {
     primary:
       'button[data-testid*="login" i], a[href*="/login" i], a[href*="/sign-in" i]',
-    fallback: 'button:has(span:contains("Sign in"))',
+    fallback: 'a[href*="login" i], a[href*="signin" i]',
   },
 };
+
+// Detect Cloudflare's "Verifying you are human" challenge interstitial. When
+// this is on screen, the page DOM never renders the real composer; reporting
+// hasInput=false until CF clears is correct, but we want to give the user a
+// helpful diagnostic.
+function isCloudflareChallenge() {
+  const url = (location.href || '').toLowerCase();
+  if (url.includes('challenge') || url.includes('cdn-cgi/challenge')) return true;
+  const title = (document.title || '').toLowerCase();
+  if (title.includes('just a moment') || title.includes('attention required')) return true;
+  const cfBox = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+  if (cfBox) return true;
+  const body = document.body && document.body.innerText ? document.body.innerText.toLowerCase() : '';
+  return body.includes('verifying you are human') || body.includes('performing security verification');
+}
 
 const DEFAULTS = {
   // Stop polling for an answer after this much total time.
@@ -403,12 +439,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     try {
       switch (msg?.type) {
         case 'PERPLEXITY_PING': {
+          const composer = getComposer();
+          const cf = isCloudflareChallenge();
           sendResponse({
             ok: true,
             where: 'perplexity-content',
             url: location.href,
-            loggedIn: !isLoggedOut(),
-            hasInput: !!getComposer(),
+            title: document.title || '',
+            cfChallenge: cf,
+            loggedIn: cf ? null : !isLoggedOut(),
+            hasInput: !!composer,
+            composerTag: composer ? composer.tagName.toLowerCase() : null,
           });
           return;
         }

@@ -536,8 +536,11 @@ function sendToTab(tabId, message) {
   });
 }
 
-async function waitForTabReady(tabId, timeoutMs = 20000) {
+async function waitForTabReady(tabId, timeoutMs = 60000) {
+  // 60s default — cold first load plus Cloudflare's "Verifying you are human"
+  // interstitial routinely takes 20–40s before Perplexity's composer renders.
   const start = Date.now();
+  let lastPing = null;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const tab = await getTab(tabId);
@@ -546,15 +549,31 @@ async function waitForTabReady(tabId, timeoutMs = 20000) {
       // Wait one more tick for content script to attach.
       await new Promise((r) => setTimeout(r, 400));
       const ping = await sendToTab(tabId, { type: 'PERPLEXITY_PING' });
-      if (ping.ok && ping.hasInput) return { ok: true, ping };
-      if (ping.ok && !ping.loggedIn) {
-        return { ok: false, loggedOut: true, error: 'You are signed out of Perplexity. Sign in and retry.' };
+      lastPing = ping;
+      if (ping.ok && ping.hasInput && !ping.cfChallenge) {
+        return { ok: true, ping };
+      }
+      // Treat the signed-out signal as final ONLY when we're certain we're on
+      // the real Perplexity page (not the CF interstitial). CF clears loggedIn
+      // to null so this gate naturally skips it.
+      if (ping.ok && ping.loggedIn === false && !ping.cfChallenge) {
+        return { ok: false, loggedOut: true, error: 'You are signed out of Perplexity. Sign in to the Perplexity tab and retry.' };
       }
     }
     if (Date.now() - start > timeoutMs) {
-      return { ok: false, error: 'Perplexity tab took too long to load.' };
+      let why = 'Perplexity tab took too long to load.';
+      if (lastPing && lastPing.ok) {
+        if (lastPing.cfChallenge) {
+          why = 'Perplexity is showing a Cloudflare verification page. Switch to the Perplexity tab, complete the "Verify you are human" check, then click Verify again.';
+        } else if (!lastPing.hasInput) {
+          why = `Could not find the Perplexity composer (URL: ${lastPing.url || 'unknown'}). The page may not be the chat UI, or Perplexity changed their markup. Open the Perplexity tab and confirm the "Ask anything" input is visible, then retry.`;
+        }
+      } else if (lastPing && !lastPing.ok) {
+        why = `Perplexity tab is not responding (${lastPing.error || 'no content-script handshake'}). Reload the Perplexity tab and retry.`;
+      }
+      return { ok: false, error: why, ping: lastPing || null };
     }
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 400));
   }
 }
 
