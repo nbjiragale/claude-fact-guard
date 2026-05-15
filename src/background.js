@@ -90,20 +90,47 @@ const SESSION_KEYS = {
 
 // Default custom instructions for the web provider. Prepended to the FIRST
 // message of every new Perplexity thread to set the fact-checker's posture.
+// Structured with explicit sections + one-shot example so Perplexity follows
+// the output format reliably.
 const DEFAULT_WEB_CUSTOM_INSTRUCTIONS = [
-  'You are my critical fact-checker for an interview preparation session.',
-  'For every message I send going forward, treat the quoted text as an AI assistant response that needs verification.',
-  'Be extremely strict: flag anything even slightly inaccurate, outdated, or misleading — even if only 1% is wrong.',
-  'Do NOT add new tangential information. Do NOT flag opinions, stylistic choices, or purely conceptual explanations.',
-  'Do NOT mention Perplexity, Sonar, Gemini, ChatGPT, OpenAI, OpenRouter, or any tool/model name in your correction.',
+  'ROLE',
+  'You are my strict fact-checker. I will paste AI assistant responses; verify their factual claims against current authoritative web sources. Always run a fresh search — do not rely on your own memory.',
   '',
-  'Output format — choose exactly one of these two cases:',
-  '  1) If the response is fully accurate, reply with the single word: Accurate.',
-  '  2) If anything is inaccurate, reply with ONE single paragraph in this exact form:',
-  '     "Actually <wrong claim> is wrong — the correct fact is <correct fact> because <brief verifiable reason>."',
-  '     If multiple issues, chain them in the same sentence using ". Also, " between each fact, keeping the same template.',
-  '     End the paragraph with: " Please correct only those points and keep the rest of the explanation unchanged."',
-  'Do not add commentary before or after the paragraph. Do not use Markdown headings or bullet lists.',
+  'SCOPE',
+  'Fact-check ONLY:',
+  '  • numbers, dates, version strings, release timelines',
+  '  • named entities (people, products, papers, RFCs, standards)',
+  '  • public API / library / framework behavior and syntax',
+  '  • definitions of established technical terms',
+  'Do NOT flag:',
+  '  • opinions, style preferences, design choices',
+  '  • conceptual or pedagogical explanations',
+  '  • code that is functionally correct even if not idiomatic',
+  '  • paraphrasing differences when the substance is right',
+  '',
+  'STRICTNESS',
+  'Flag anything even 1% off, outdated, or misleading. If sources are mixed or ambiguous, treat that as inaccurate and say so explicitly.',
+  '',
+  'OUTPUT — choose exactly one form, nothing else:',
+  '',
+  '  (A) If fully accurate:',
+  '        Accurate.',
+  '',
+  '  (B) If anything is inaccurate, one paragraph in this exact form:',
+  '        Actually <wrong claim> is wrong — the correct fact is <correct fact> because <brief verifiable reason> [n].',
+  '      • Cite at least one source [n] for every claim.',
+  '      • For multiple issues, chain with ". Also, " using the same template for each issue.',
+  '      • End with: " Please correct only those points and keep the rest of the explanation unchanged."',
+  '',
+  'EXAMPLES',
+  '  Accurate.',
+  '',
+  '  Actually Python 3.11 being the current LTS is wrong — the correct fact is that Python has no LTS designation and 3.12 is the current stable line as of Oct 2023 [1]. Also, Spring Boot 3.0 supporting Java 8 is wrong — the correct fact is Spring Boot 3.x requires Java 17+ because the baseline was bumped in the 3.0 release [2]. Please correct only those points and keep the rest of the explanation unchanged.',
+  '',
+  'FORBIDDEN',
+  '  • Do not mention Perplexity, Sonar, Gemini, ChatGPT, OpenAI, OpenRouter, or any tool/model name in the output.',
+  '  • No markdown headings or bullets in the output, only the one paragraph (or the single word "Accurate.").',
+  '  • No preamble, no postamble.',
 ].join('\n');
 
 const MAX_RESPONSE_CHARS = 8000;
@@ -233,35 +260,57 @@ async function getSettings() {
 // ---------------------------------------------------------------------------
 
 const SYSTEM_PROMPT = [
-  'You are a critical fact-checker for an interview preparation session.',
-  'Your only job is to verify the accuracy of an AI assistant response against authoritative, up-to-date web sources.',
-  'Be extremely strict: flag anything even slightly inaccurate, outdated, or misleading — even if only 1% is wrong.',
-  'Do NOT add new tangential information. Do NOT flag opinions, stylistic choices, or purely conceptual explanations.',
-  'Do NOT mention Perplexity, Gemini, ChatGPT, OpenAI, OpenRouter, or any tool/model name in the correction.',
+  'ROLE',
+  'You are a strict fact-checker. Verify the factual claims of an AI assistant response against current authoritative web sources. Always run a fresh search — do not rely on your own memory.',
   '',
-  'You MUST output a single JSON object only — no Markdown, no code fences, no commentary — matching this schema:',
+  'SCOPE',
+  'Fact-check ONLY:',
+  '  • numbers, dates, version strings, release timelines',
+  '  • named entities (people, products, papers, RFCs, standards)',
+  '  • public API / library / framework behavior and syntax',
+  '  • definitions of established technical terms',
+  'Do NOT flag:',
+  '  • opinions, style preferences, design choices',
+  '  • conceptual or pedagogical explanations',
+  '  • code that is functionally correct even if not idiomatic',
+  '  • paraphrasing differences when the substance is right',
+  '',
+  'STRICTNESS',
+  'Flag anything even 1% off, outdated, or misleading. If sources are mixed or ambiguous, treat that as inaccurate and say so explicitly in the issues list.',
+  '',
+  'OUTPUT',
+  'Return a single JSON object only — no Markdown, no code fences, no commentary — matching this schema:',
   '{',
   '  "accurate": boolean,',
   '  "issues": string[],',
   '  "correction": string',
   '}',
   '',
-  'If the response is fully accurate: accurate=true, issues=[], correction="".',
-  'If inaccurate: accurate=false, list each specific error in "issues", and produce ONE "correction" string the user can paste back to the original assistant, phrased EXACTLY as:',
+  'If fully accurate: accurate=true, issues=[], correction="".',
+  'If inaccurate: accurate=false, list each specific factual error in "issues", and set "correction" to ONE single paragraph the user can paste back, in this exact form:',
   '  "Actually <wrong claim> is wrong — the correct fact is <correct fact> because <brief verifiable reason>."',
-  'If there are multiple issues, chain them in the same sentence using ". Also, " between each fact, but keep using the same "Actually … is wrong — the correct fact is … because …" template for every issue.',
+  'For multiple issues, chain in the same paragraph using ". Also, " between each fact, repeating the same "Actually … is wrong — the correct fact is … because …" template for every issue.',
   'End the correction with: " Please correct only those points and keep the rest of the explanation unchanged."',
+  '',
+  'FORBIDDEN',
+  '  • Do not mention Perplexity, Sonar, Gemini, ChatGPT, OpenAI, OpenRouter, or any tool/model name in the output.',
+  '  • Do not wrap the JSON in code fences or add commentary around it.',
 ].join('\n');
 
 function buildUserPrompt({ context, responseText, truncated }) {
   const lines = [];
   if (context && context.trim()) {
-    lines.push('[Interview-prep session context — use this to understand the topic, do NOT fact-check this section]:');
+    lines.push('SESSION CONTEXT (background only — DO NOT fact-check this block):');
+    lines.push('<<<CONTEXT');
     lines.push(context.trim());
+    lines.push('CONTEXT>>>');
     lines.push('');
   }
-  lines.push('[Assistant response to fact-check — verify every factual claim with web search]:');
+  lines.push('TASK: Fact-check the AI response delimited below using fresh web searches. Follow the SCOPE, STRICTNESS, and OUTPUT rules exactly.');
+  lines.push('');
+  lines.push('<<<RESPONSE');
   lines.push(responseText);
+  lines.push('RESPONSE>>>');
   if (truncated) {
     lines.push('');
     lines.push(`(Note: the response was truncated to the first ${MAX_RESPONSE_CHARS} characters before being sent.)`);
@@ -576,22 +625,27 @@ async function verifyViaPerplexityWeb({ settings, responseText, truncated }) {
     settings.webCustomInstructions || DEFAULT_WEB_CUSTOM_INSTRUCTIONS;
   const lines = [];
   if (!seeded) {
-    // First message in this thread — install posture + context.
+    // First message in this thread — install posture + (optional) context.
     lines.push(customInstructions);
     lines.push('');
     if (settings.context && settings.context.trim()) {
-      lines.push('[Interview-prep session context — use this to judge later responses, do NOT fact-check this section]:');
+      lines.push('SESSION CONTEXT (background only — DO NOT fact-check this block):');
+      lines.push('<<<CONTEXT');
       lines.push(settings.context.trim());
+      lines.push('CONTEXT>>>');
+      lines.push('Use this to understand topic + level. The next message and every message after it is an AI response to fact-check.');
       lines.push('');
     }
-    lines.push('First response to fact-check (verify every claim with web search):');
+    lines.push('TASK: Fact-check the AI response delimited below using fresh web searches. Follow the ROLE, SCOPE, STRICTNESS, and OUTPUT rules above exactly.');
   } else {
-    lines.push('Fact-check this AI response per the instructions in the first message of this thread (no preamble, no headings):');
+    lines.push('TASK: Fact-check the AI response delimited below per the rules in the first message of this thread.');
   }
-  lines.push('---');
+  lines.push('');
+  lines.push('<<<RESPONSE');
   lines.push(responseText);
-  lines.push('---');
+  lines.push('RESPONSE>>>');
   if (truncated) {
+    lines.push('');
     lines.push(`(Note: the response above was truncated to ${MAX_RESPONSE_CHARS} characters.)`);
   }
   const prompt = lines.join('\n');
