@@ -205,6 +205,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: true, where: 'content', url: location.href });
         return;
       }
+      case 'APPLY_HIGHLIGHTS': {
+        try {
+          const out = applyInlineHighlights(msg.verdict || null);
+          sendResponse({ ok: true, ...out });
+        } catch (err) {
+          sendResponse({ ok: false, error: err?.message || String(err) });
+        }
+        return;
+      }
+      case 'CLEAR_HIGHLIGHTS': {
+        try {
+          clearInlineHighlights();
+          sendResponse({ ok: true });
+        } catch (err) {
+          sendResponse({ ok: false, error: err?.message || String(err) });
+        }
+        return;
+      }
       default:
         sendResponse({ ok: false, error: `Unknown message type: ${msg?.type}` });
     }
@@ -328,4 +346,463 @@ try {
   });
 } catch (err) {
   warn('failed to subscribe to autoVerify setting', err);
+}
+
+// ---------------------------------------------------------------------------
+// Inline highlights (Grammarly-style)
+//
+// When the side-panel verify (manual or auto) returns an INACCURATE verdict
+// with `inlineIssues[]`, the background sends APPLY_HIGHLIGHTS here. For
+// every {quote, fix, why} block, we find the verbatim QUOTE inside the
+// latest Claude assistant message and wrap it in a marked span with a
+// hover/click popover that surfaces the correction + sources.
+//
+// Design constraints:
+//   • Never modify Claude's editable composer DOM — we only decorate the
+//     read-only assistant-message subtree.
+//   • Skip <pre>/<code> blocks entirely; code is not fact-checked.
+//   • Tolerant text matching: tries the exact QUOTE first, then strips
+//     curly quotes / collapses whitespace and retries, finally falls back
+//     to the most distinctive token (4+ char alnum word).
+//   • Re-applies if Claude re-renders the assistant message (SPA navigation,
+//     streaming refresh) — we cache the last verdict + a snapshot of the
+//     message DOM signature and re-mark on relevant mutations.
+//   • A single shared popover element is reused across all highlight spans.
+// ---------------------------------------------------------------------------
+
+const HIGHLIGHT_CLASS = 'cfg-issue';
+const HIGHLIGHT_DATA = 'data-cfg-issue';
+const POPOVER_ID = 'cfg-issue-popover';
+const HIGHLIGHT_STYLE_ID = 'cfg-issue-style';
+const HIGHLIGHT_MAX_ISSUES = 12;
+
+let cachedHighlightVerdict = null;
+let highlightReapplyTimer = null;
+let highlightObserverAttached = false;
+
+function ensureHighlightStyles() {
+  if (document.getElementById(HIGHLIGHT_STYLE_ID)) return;
+  const style = document.createElement('style');
+  style.id = HIGHLIGHT_STYLE_ID;
+  style.textContent = `
+    .${HIGHLIGHT_CLASS} {
+      background: linear-gradient(transparent 60%, rgba(217,119,87,0.32) 60%);
+      border-bottom: 2px solid #d97757;
+      cursor: pointer;
+      border-radius: 1px;
+      padding: 0 1px;
+      transition: background 0.12s ease;
+    }
+    .${HIGHLIGHT_CLASS}:hover {
+      background: linear-gradient(transparent 60%, rgba(217,119,87,0.55) 60%);
+    }
+    #${POPOVER_ID} {
+      position: absolute;
+      z-index: 2147483646;
+      max-width: 380px;
+      min-width: 240px;
+      background: #ffffff;
+      color: #2D2A26;
+      border: 1px solid #d8d3c1;
+      border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+      padding: 12px 14px;
+      font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      pointer-events: auto;
+    }
+    #${POPOVER_ID} .cfg-pop-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #d97757;
+      margin-bottom: 8px;
+    }
+    #${POPOVER_ID} .cfg-pop-quote {
+      font-size: 12px;
+      color: #8a847a;
+      text-decoration: line-through;
+      margin-bottom: 6px;
+      word-break: break-word;
+    }
+    #${POPOVER_ID} .cfg-pop-fix {
+      font-size: 13px;
+      color: #2D2A26;
+      font-weight: 600;
+      margin-bottom: 4px;
+      word-break: break-word;
+    }
+    #${POPOVER_ID} .cfg-pop-why {
+      font-size: 12px;
+      color: #5b564f;
+      word-break: break-word;
+      margin-bottom: 8px;
+    }
+    #${POPOVER_ID} .cfg-pop-sources {
+      font-size: 11px;
+      color: #8a847a;
+      margin-bottom: 8px;
+      word-break: break-all;
+    }
+    #${POPOVER_ID} .cfg-pop-sources a {
+      color: #d97757;
+      text-decoration: none;
+      margin-right: 6px;
+    }
+    #${POPOVER_ID} .cfg-pop-sources a:hover {
+      text-decoration: underline;
+    }
+    #${POPOVER_ID} .cfg-pop-actions {
+      display: flex;
+      gap: 8px;
+    }
+    #${POPOVER_ID} button.cfg-pop-btn {
+      flex: 1;
+      font: inherit;
+      font-size: 12px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid #d8d3c1;
+      background: #faf9f5;
+      color: #2D2A26;
+      cursor: pointer;
+    }
+    #${POPOVER_ID} button.cfg-pop-btn.primary {
+      background: #d97757;
+      color: #ffffff;
+      border-color: #d97757;
+    }
+    #${POPOVER_ID} button.cfg-pop-btn:hover {
+      filter: brightness(0.96);
+    }
+    @media (prefers-color-scheme: dark) {
+      #${POPOVER_ID} {
+        background: #2C2A25;
+        color: #F0EEE6;
+        border-color: #423E37;
+      }
+      #${POPOVER_ID} .cfg-pop-fix { color: #F0EEE6; }
+      #${POPOVER_ID} .cfg-pop-why { color: #c8c1b6; }
+      #${POPOVER_ID} button.cfg-pop-btn {
+        background: #1F1E1B;
+        color: #F0EEE6;
+        border-color: #423E37;
+      }
+    }
+  `;
+  document.documentElement.appendChild(style);
+}
+
+function getLatestAssistantElement() {
+  const messages = querySelectorAllWithFallback(SELECTORS.assistantMessage);
+  if (!messages.length) return null;
+  return messages[messages.length - 1];
+}
+
+function clearInlineHighlights(scope) {
+  const root = scope || document;
+  const marks = root.querySelectorAll(`span.${HIGHLIGHT_CLASS}`);
+  marks.forEach((mark) => {
+    const parent = mark.parentNode;
+    if (!parent) return;
+    while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+    parent.removeChild(mark);
+    parent.normalize?.();
+  });
+  hidePopover();
+}
+
+function normalizeForMatch(s) {
+  return (s || '')
+    .replace(/[\u201C\u201D\u2018\u2019]/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function shouldSkipNode(node) {
+  let cur = node.parentNode;
+  while (cur && cur !== document.body) {
+    if (
+      cur.classList?.contains(HIGHLIGHT_CLASS) ||
+      cur.tagName === 'PRE' ||
+      cur.tagName === 'CODE' ||
+      cur.tagName === 'SCRIPT' ||
+      cur.tagName === 'STYLE'
+    ) {
+      return true;
+    }
+    cur = cur.parentNode;
+  }
+  return false;
+}
+
+function collectTextNodes(root) {
+  const out = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(n) {
+      if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+      if (shouldSkipNode(n)) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  let n;
+  while ((n = walker.nextNode())) out.push(n);
+  return out;
+}
+
+function findAndWrap(root, quote, issue, index) {
+  if (!quote) return false;
+  const needle = normalizeForMatch(quote).toLowerCase();
+  if (needle.length < 3) return false;
+
+  const nodes = collectTextNodes(root);
+  for (const node of nodes) {
+    const value = node.nodeValue || '';
+    const hay = normalizeForMatch(value).toLowerCase();
+    const idx = hay.indexOf(needle);
+    if (idx === -1) continue;
+    // Map normalized index back to the original string. We walk the raw
+    // value collapsing whitespace runs to a single space, just like
+    // normalizeForMatch does, and track positions so we know which
+    // original-char range corresponds to the normalized hit.
+    const range = mapNormalizedRange(value, idx, needle.length);
+    if (!range) continue;
+    wrapRange(node, range.start, range.end, issue, index);
+    return true;
+  }
+
+  // Fallback: longest distinctive token (4+ char alnum + numbers).
+  const tokens = needle.match(/[\w\d]{4,}/g) || [];
+  tokens.sort((a, b) => b.length - a.length);
+  for (const tok of tokens) {
+    for (const node of nodes) {
+      const value = node.nodeValue || '';
+      const lower = value.toLowerCase();
+      const idx = lower.indexOf(tok);
+      if (idx === -1) continue;
+      wrapRange(node, idx, idx + tok.length, issue, index);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Map a (start, length) range expressed against the normalized version of
+// `value` back to a (start, end) range in the original `value`. Returns
+// null if mapping fails (e.g. trailing whitespace eaten by collapse).
+function mapNormalizedRange(value, normStart, normLen) {
+  let normIdx = 0;
+  let startOrig = -1;
+  let endOrig = -1;
+  let prevSpace = false;
+  const normEnd = normStart + normLen;
+  // The normalizeForMatch trim() can strip leading whitespace; emulate.
+  let leading = 0;
+  while (leading < value.length && /\s/.test(value[leading])) leading++;
+  for (let i = leading; i < value.length; i++) {
+    const ch = value[i];
+    const isSpace = /\s/.test(ch);
+    let normCh = ch;
+    if (isSpace) {
+      if (prevSpace) continue;
+      normCh = ' ';
+    }
+    if (normIdx === normStart && startOrig === -1) startOrig = i;
+    if (normIdx === normEnd && endOrig === -1) {
+      endOrig = i;
+      break;
+    }
+    normIdx++;
+    prevSpace = isSpace;
+  }
+  if (startOrig === -1) return null;
+  if (endOrig === -1) endOrig = value.length;
+  return { start: startOrig, end: endOrig };
+}
+
+function wrapRange(textNode, start, end, issue, index) {
+  const value = textNode.nodeValue || '';
+  if (start < 0 || end > value.length || start >= end) return;
+  const before = value.slice(0, start);
+  const middle = value.slice(start, end);
+  const after = value.slice(end);
+  const span = document.createElement('span');
+  span.className = HIGHLIGHT_CLASS;
+  span.setAttribute(HIGHLIGHT_DATA, String(index));
+  span.textContent = middle;
+  span.dataset.cfgQuote = issue.quote || '';
+  span.dataset.cfgFix = issue.fix || '';
+  span.dataset.cfgWhy = issue.why || '';
+  span.dataset.cfgSources = JSON.stringify(issue.citations || []);
+  span.addEventListener('click', onHighlightClick, { passive: true });
+  span.addEventListener('mouseenter', onHighlightHover, { passive: true });
+  const parent = textNode.parentNode;
+  if (!parent) return;
+  const beforeNode = document.createTextNode(before);
+  const afterNode = document.createTextNode(after);
+  parent.insertBefore(beforeNode, textNode);
+  parent.insertBefore(span, textNode);
+  parent.insertBefore(afterNode, textNode);
+  parent.removeChild(textNode);
+}
+
+function getOrCreatePopover() {
+  let pop = document.getElementById(POPOVER_ID);
+  if (pop) return pop;
+  pop = document.createElement('div');
+  pop.id = POPOVER_ID;
+  pop.style.display = 'none';
+  pop.addEventListener('mouseleave', () => hidePopover());
+  document.body.appendChild(pop);
+  // Click-outside dismiss.
+  document.addEventListener('click', (e) => {
+    if (!pop) return;
+    if (pop.style.display === 'none') return;
+    if (pop.contains(e.target) || e.target.classList?.contains(HIGHLIGHT_CLASS)) return;
+    hidePopover();
+  });
+  return pop;
+}
+
+function hidePopover() {
+  const pop = document.getElementById(POPOVER_ID);
+  if (pop) pop.style.display = 'none';
+}
+
+function buildPopoverContent(quote, fix, why, citations) {
+  const safeQuote = (quote || '').replace(/[<>&]/g, (c) => `&#${c.charCodeAt(0)};`);
+  const safeFix = (fix || '').replace(/[<>&]/g, (c) => `&#${c.charCodeAt(0)};`);
+  const safeWhy = (why || '').replace(/[<>&]/g, (c) => `&#${c.charCodeAt(0)};`);
+  const sourcesHtml = (citations || [])
+    .slice(0, 4)
+    .map((u, i) => {
+      const url = (u || '').replace(/"/g, '%22');
+      return `<a href="${url}" target="_blank" rel="noopener noreferrer">[${i + 1}]</a>`;
+    })
+    .join(' ');
+  return `
+    <div class="cfg-pop-header">Inaccurate · Fact Guard</div>
+    <div class="cfg-pop-quote">"${safeQuote}"</div>
+    <div class="cfg-pop-fix">${safeFix || 'See correction in the side panel.'}</div>
+    ${safeWhy ? `<div class="cfg-pop-why">${safeWhy}</div>` : ''}
+    ${sourcesHtml ? `<div class="cfg-pop-sources">${sourcesHtml}</div>` : ''}
+    <div class="cfg-pop-actions">
+      <button class="cfg-pop-btn" data-cfg-act="copy">Copy correction</button>
+      <button class="cfg-pop-btn primary" data-cfg-act="dismiss">Dismiss</button>
+    </div>
+  `;
+}
+
+function positionPopover(pop, span) {
+  const rect = span.getBoundingClientRect();
+  const scrollX = window.pageXOffset || document.documentElement.scrollLeft;
+  const scrollY = window.pageYOffset || document.documentElement.scrollTop;
+  pop.style.display = 'block';
+  // Default below-and-left-aligned; flip above if too close to bottom.
+  const popH = pop.offsetHeight || 160;
+  const popW = pop.offsetWidth || 320;
+  let top = rect.bottom + scrollY + 8;
+  if (rect.bottom + popH + 12 > window.innerHeight) {
+    top = rect.top + scrollY - popH - 8;
+    if (top < scrollY + 8) top = scrollY + 8;
+  }
+  let left = rect.left + scrollX;
+  if (left + popW + 12 > window.innerWidth + scrollX) {
+    left = window.innerWidth + scrollX - popW - 12;
+  }
+  if (left < scrollX + 8) left = scrollX + 8;
+  pop.style.top = `${top}px`;
+  pop.style.left = `${left}px`;
+}
+
+function showPopoverForSpan(span) {
+  const pop = getOrCreatePopover();
+  const quote = span.dataset.cfgQuote || span.textContent;
+  const fix = span.dataset.cfgFix || '';
+  const why = span.dataset.cfgWhy || '';
+  let citations = [];
+  try {
+    citations = JSON.parse(span.dataset.cfgSources || '[]');
+  } catch (_) {
+    citations = [];
+  }
+  pop.innerHTML = buildPopoverContent(quote, fix, why, citations);
+  pop.querySelector('[data-cfg-act="dismiss"]')?.addEventListener('click', () => hidePopover());
+  pop.querySelector('[data-cfg-act="copy"]')?.addEventListener('click', () => {
+    const text = fix
+      ? why
+        ? `${fix} (${why})`
+        : fix
+      : quote;
+    try {
+      navigator.clipboard.writeText(text).catch(() => {});
+    } catch (_) {
+      /* ignore */
+    }
+  });
+  positionPopover(pop, span);
+}
+
+function onHighlightHover(e) {
+  showPopoverForSpan(e.currentTarget);
+}
+
+function onHighlightClick(e) {
+  e.stopPropagation();
+  showPopoverForSpan(e.currentTarget);
+}
+
+function applyInlineHighlights(verdict) {
+  ensureHighlightStyles();
+  // Always tear down old highlights — verdict may have changed.
+  clearInlineHighlights();
+  cachedHighlightVerdict = verdict;
+  if (!verdict || verdict.accurate || !Array.isArray(verdict.inlineIssues)) {
+    return { applied: 0 };
+  }
+  const root = getLatestAssistantElement();
+  if (!root) return { applied: 0 };
+  const citations = Array.isArray(verdict.citations) ? verdict.citations : [];
+  let applied = 0;
+  verdict.inlineIssues.slice(0, HIGHLIGHT_MAX_ISSUES).forEach((issue, i) => {
+    if (!issue || !issue.quote) return;
+    const enriched = {
+      quote: issue.quote,
+      fix: issue.fix || '',
+      why: issue.why || '',
+      citations: (issue.sourceTags || [])
+        .map((tag) => citations[tag - 1])
+        .filter(Boolean),
+    };
+    if (enriched.citations.length === 0) enriched.citations = citations.slice(0, 2);
+    const ok = findAndWrap(root, issue.quote, enriched, i);
+    if (ok) applied++;
+  });
+  attachHighlightReapplyObserver();
+  return { applied };
+}
+
+function attachHighlightReapplyObserver() {
+  if (highlightObserverAttached) return;
+  highlightObserverAttached = true;
+  const obs = new MutationObserver(() => {
+    if (!cachedHighlightVerdict) return;
+    const root = getLatestAssistantElement();
+    if (!root) return;
+    // If our marks are gone (Claude re-rendered) and we still have a
+    // cached verdict, debounce a re-apply.
+    if (!root.querySelector(`.${HIGHLIGHT_CLASS}`)) {
+      if (highlightReapplyTimer) clearTimeout(highlightReapplyTimer);
+      highlightReapplyTimer = setTimeout(() => {
+        highlightReapplyTimer = null;
+        if (cachedHighlightVerdict && !cachedHighlightVerdict.accurate) {
+          applyInlineHighlights(cachedHighlightVerdict);
+        }
+      }, 600);
+    }
+  });
+  obs.observe(document.body, { subtree: true, childList: true });
 }

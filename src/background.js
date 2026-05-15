@@ -81,6 +81,8 @@ const STORAGE_KEYS = {
   webCustomInstructions: 'perplexityWebCustomInstructions',
   // auto-verify
   autoVerify: 'autoVerify',
+  // inline corrections (highlight wrong claims directly in Claude's reply)
+  inlineHighlights: 'inlineHighlights',
 };
 
 const SESSION_KEYS = {
@@ -122,24 +124,39 @@ const DEFAULT_WEB_CUSTOM_INSTRUCTIONS = [
   '        ACCURATE',
   '        <one short sentence describing what you verified, no markdown>',
   '',
-  '  (B) If you found at least one authoritative source that explicitly contradicts a factual claim:',
+  '  (B) If you found at least one authoritative source that explicitly contradicts a factual claim, output ONE block PER wrong claim using this exact line-based schema (do NOT use markdown bullets or prose paragraphs):',
   '        INACCURATE',
-  '        Actually <wrong claim> is wrong — the correct fact is <correct fact> because <brief verifiable reason> [n].',
-  '      • Cite at least one source [n] for every claim.',
-  '      • For multiple issues, chain with ". Also, " using the same template for each issue.',
-  '      • End with: " Please correct only those points and keep the rest of the explanation unchanged."',
+  '        QUOTE: "<copy the wrong claim VERBATIM from the response — exact characters, no paraphrasing, no markdown — keep the original capitalisation and punctuation>"',
+  '        FIX: <the correct fact in one short sentence>',
+  '        WHY: <one short verifiable reason, no markdown> [n]',
+  '        ---',
+  '        QUOTE: "<next verbatim wrong excerpt>"',
+  '        FIX: <correct fact>',
+  '        WHY: <reason> [n]',
+  '',
+  '      • QUOTE must be a contiguous substring of the response you were asked to check. If you cannot quote the wrong text verbatim, do NOT flag it — mark ACCURATE.',
+  '      • Each block is separated by a single line containing exactly three hyphens (---).',
+  '      • Cite at least one source [n] in WHY for every block.',
+  '      • Do not include any prose outside these blocks.',
   '',
   'EXAMPLES',
   '  ACCURATE',
   '  Siddaramaiah is the current CM of Karnataka, sworn in May 20 2023, INC, MLA from Varuna — all substantive claims verified [1][2].',
   '',
   '  INACCURATE',
-  '  Actually Python 3.11 being the current LTS is wrong — the correct fact is that Python has no LTS designation and 3.12 is the current stable line as of Oct 2023 [1]. Also, Spring Boot 3.0 supporting Java 8 is wrong — the correct fact is Spring Boot 3.x requires Java 17+ because the baseline was bumped in the 3.0 release [2]. Please correct only those points and keep the rest of the explanation unchanged.',
+  '  QUOTE: "Python 3.11 is the current LTS version"',
+  '  FIX: Python has no LTS designation; 3.12 is the current stable line as of Oct 2023.',
+  '  WHY: PEP 602 and python.org\'s release schedule list no LTS designation; 3.12 was released Oct 2023 [1].',
+  '  ---',
+  '  QUOTE: "Spring Boot 3.0 supports Java 8"',
+  '  FIX: Spring Boot 3.x requires Java 17 or newer.',
+  '  WHY: Spring Boot 3.0 release notes explicitly bump the baseline from Java 8 to Java 17 [2].',
   '',
   'FORBIDDEN',
   '  • Do not mention Perplexity, Sonar, Gemini, ChatGPT, OpenAI, OpenRouter, or any tool/model name in the output.',
-  '  • No markdown headings or bullets in the output.',
+  '  • No markdown headings, bullets, or prose paragraphs in the output. Only the QUOTE/FIX/WHY schema for INACCURATE.',
   '  • No preamble, no postamble, no extra commentary outside the format above.',
+  '  • Never paraphrase the QUOTE — it must be a verbatim substring of the response, otherwise the highlight will not match.',
   '  • Never write INACCURATE for a claim that is factually correct but less detailed or differently phrased. Substance only.',
 ].join('\n');
 
@@ -244,6 +261,16 @@ function isLegacyManagedDefault(saved) {
   ) {
     return true;
   }
+  // 3.1.1 structured default (first-line verdict + loosened SCOPE, but the
+  // INACCURATE branch was a free-form "Actually X is wrong" paragraph — no
+  // QUOTE/FIX/WHY schema yet). Detect by presence of the v3.1.1 SCOPE
+  // bullets but absence of the new QUOTE: schema.
+  if (
+    saved.includes('less detail than your sources provide') &&
+    !saved.includes('QUOTE:')
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -283,6 +310,12 @@ async function getSettings() {
       ? data[STORAGE_KEYS.webCustomInstructions]
       : DEFAULT_WEB_CUSTOM_INSTRUCTIONS;
   const autoVerify = data[STORAGE_KEYS.autoVerify] === true;
+  // Inline highlights default to ON; only flip off if user has explicitly
+  // saved `false`. `undefined` means "never set" → use the default.
+  const inlineHighlights =
+    data[STORAGE_KEYS.inlineHighlights] === undefined
+      ? true
+      : data[STORAGE_KEYS.inlineHighlights] === true;
   return {
     provider,
     perplexityKey: data[STORAGE_KEYS.apiKey.perplexity] || '',
@@ -292,6 +325,7 @@ async function getSettings() {
     webVisible,
     webCustomInstructions,
     autoVerify,
+    inlineHighlights,
   };
 }
 
@@ -457,6 +491,10 @@ function normalizeVerdict(parsed, citations) {
   return {
     accurate,
     issues,
+    // API providers return free-form JSON without inline-issue quotes, so
+    // we just emit an empty array. Inline highlighting is best-effort and
+    // only the Web provider supports it today.
+    inlineIssues: [],
     correction: accurate ? '' : correction,
     citations: Array.isArray(citations) ? citations : [],
   };
@@ -669,6 +707,7 @@ function parseWebAnswer(answerText) {
     return {
       accurate: true,
       issues: [],
+      inlineIssues: [],
       correction: rest || '',
     };
   }
@@ -680,12 +719,12 @@ function parseWebAnswer(answerText) {
   // Backward-compat: legacy responses without the explicit first-line label.
   // If the whole answer is just "Accurate." treat it as accurate.
   if (/^accurate\.?\s*$/i.test(trimmed)) {
-    return { accurate: true, issues: [], correction: '' };
+    return { accurate: true, issues: [], inlineIssues: [], correction: '' };
   }
   // Or if the first paragraph alone is "Accurate.".
   const firstPara = trimmed.split(/\n{2,}/)[0].trim();
   if (/^accurate\.?$/i.test(firstPara)) {
-    return { accurate: true, issues: [], correction: '' };
+    return { accurate: true, issues: [], inlineIssues: [], correction: '' };
   }
 
   // Legacy: paragraph starting with "Actually … is wrong".
@@ -693,20 +732,60 @@ function parseWebAnswer(answerText) {
     return extractInaccurate(trimmed, /* haveExplicitLabel */ false);
   }
 
-  // Unparseable — surface raw text but be honest that we couldn't classify.
-  // Default to ACCURATE so we don't mislabel a likely-accurate answer just
-  // because the model went off-format.
+  // Unparseable — default to ACCURATE so we don't mislabel a likely-accurate
+  // answer just because the model went off-format. Surface raw text so the
+  // user can read it in the side panel.
   return {
     accurate: true,
     issues: [],
+    inlineIssues: [],
     correction: trimmed,
   };
 }
 
+// Parse the structured INACCURATE body into (a) inlineIssues for the
+// content-script highlighter, (b) a flat issues[] array of one-line
+// summaries for the side panel, (c) a correction string for the
+// "paste back into Claude" affordance.
+//
+// Recognised schema (v3.2+):
+//   QUOTE: "<verbatim wrong excerpt>"
+//   FIX: <correct fact>
+//   WHY: <reason> [n]
+//   ---
+//   QUOTE: "..."
+//   FIX: ...
+//   WHY: ... [n]
+//
+// Legacy fallback (v3.1.x and earlier): a free-form "Actually X is
+// wrong — the correct fact is Y because Z [n]. Also, ..." paragraph.
 function extractInaccurate(body, haveExplicitLabel) {
   const text = (body || '').trim();
-  // Prefer the literal "Actually … Please correct only those points…"
-  // paragraph if it's there. Otherwise just use the whole body.
+
+  const inlineIssues = parseQuoteFixWhyBlocks(text);
+  if (inlineIssues.length > 0) {
+    const issues = inlineIssues.map(
+      (b) => b.quote || b.fix || '(see correction)',
+    );
+    const correction = inlineIssues
+      .map((b) => {
+        const parts = [];
+        if (b.quote) parts.push(`Actually "${b.quote}" is wrong`);
+        if (b.fix) parts.push(`the correct fact is ${b.fix}`);
+        if (b.why) parts.push(`because ${b.why}`);
+        return parts.join(' — ');
+      })
+      .join('. Also, ')
+      .concat(' Please correct only those points and keep the rest of the explanation unchanged.');
+    return {
+      accurate: false,
+      issues,
+      inlineIssues,
+      correction,
+    };
+  }
+
+  // Legacy free-form paragraph.
   const match = text.match(/Actually[\s\S]+?(?:Please correct only those points and keep the rest of the explanation unchanged\.?|$)/i);
   const correction = match ? match[0].trim() : text;
 
@@ -724,8 +803,48 @@ function extractInaccurate(body, haveExplicitLabel) {
       : haveExplicitLabel
         ? ['(see correction)']
         : ['Perplexity did not follow the template; raw answer below.'],
+    inlineIssues: [],
     correction,
   };
+}
+
+// Extract a list of {quote, fix, why, sources[]} blocks from a body that
+// uses the QUOTE: / FIX: / WHY: schema separated by --- lines. Tolerant
+// of missing fields and extra whitespace; rejects blocks without a
+// non-empty QUOTE since we cannot highlight what we can't quote.
+function parseQuoteFixWhyBlocks(body) {
+  if (!body || !/QUOTE\s*:/i.test(body)) return [];
+  const blocks = body
+    .split(/^\s*-{3,}\s*$/m)
+    .map((b) => b.trim())
+    .filter(Boolean);
+  const out = [];
+  for (const block of blocks) {
+    const quoteMatch = block.match(/QUOTE\s*:\s*([\s\S]*?)(?=\n\s*(?:FIX|WHY)\s*:|$)/i);
+    const fixMatch = block.match(/FIX\s*:\s*([\s\S]*?)(?=\n\s*(?:QUOTE|WHY)\s*:|$)/i);
+    const whyMatch = block.match(/WHY\s*:\s*([\s\S]*?)(?=\n\s*(?:QUOTE|FIX)\s*:|$)/i);
+    let quote = quoteMatch ? quoteMatch[1].trim() : '';
+    // Strip surrounding straight or smart quotes if present.
+    quote = quote
+      .replace(/^["\u201C\u201D\u2018\u2019\u00AB]+/, '')
+      .replace(/["\u201C\u201D\u2018\u2019\u00BB]+$/, '')
+      .trim();
+    if (!quote) continue;
+    const fix = fixMatch ? fixMatch[1].trim() : '';
+    const why = whyMatch ? whyMatch[1].trim() : '';
+    const sourceTags = Array.from(
+      `${fix}\n${why}`.matchAll(/\[(\d+)\]/g),
+      (m) => Number(m[1]),
+    );
+    out.push({
+      quote,
+      fix,
+      why,
+      sourceTags,
+    });
+    if (out.length >= 12) break;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +903,7 @@ async function verifyViaPerplexityWeb({ settings, responseText, truncated }) {
     verdict: {
       accurate: parsed.accurate,
       issues: parsed.issues,
+      inlineIssues: parsed.inlineIssues || [],
       correction: parsed.correction,
       citations: Array.isArray(out.citations) ? out.citations : [],
       partial: !!out.partial,
@@ -833,6 +953,40 @@ async function verifyViaApi({ settings, responseText, truncated }) {
 // The user explicitly chose skip-over-queue behaviour for option (b).
 let autoVerifyInFlight = false;
 
+// Find the most recently focused claude.ai tab and ask its content script
+// to apply (or clear) inline highlights for this verdict. Best-effort: if
+// no Claude tab is open, or if the tab hasn't loaded the content script
+// yet, silently no-op. The side panel remains the canonical surface.
+async function pushHighlightsToClaudeTab(verdict, responseText) {
+  if (!verdict) return;
+  const tabs = await queryTabs({ url: 'https://claude.ai/*' });
+  if (!tabs.length) return;
+  // Prefer the active tab if there is one, else the most recently used.
+  const sorted = tabs.slice().sort((a, b) => {
+    if (a.active && !b.active) return -1;
+    if (!a.active && b.active) return 1;
+    return (b.lastAccessed || 0) - (a.lastAccessed || 0);
+  });
+  const tab = sorted[0];
+  if (!tab?.id) return;
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(
+      tab.id,
+      {
+        type: 'APPLY_HIGHLIGHTS',
+        verdict,
+        responseText: (responseText || '').toString(),
+      },
+      () => {
+        // chrome.runtime.lastError is expected when no listener is on the
+        // tab; we don't surface it.
+        void chrome.runtime.lastError;
+        resolve();
+      },
+    );
+  });
+}
+
 async function handleVerify(payload) {
   const settings = await getSettings();
   if (payload?.auto) {
@@ -865,6 +1019,9 @@ async function handleVerify(payload) {
         lastError: null,
         lastVerdict: cached.verdict,
       });
+      if (settings.inlineHighlights) {
+        pushHighlightsToClaudeTab(cached.verdict, responseText).catch(() => {});
+      }
       return { ok: true, verdict: cached.verdict, fromCache: true };
     }
   }
@@ -893,6 +1050,9 @@ async function handleVerify(payload) {
       lastVerdict: result.verdict,
     });
     await cacheVerdict(dedupHash, result.verdict);
+    if (settings.inlineHighlights) {
+      pushHighlightsToClaudeTab(result.verdict, responseText).catch(() => {});
+    }
     return { ok: true, verdict: result.verdict, fromCache: false };
   } catch (err) {
     const msg = err?.message || String(err);
@@ -973,6 +1133,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           }
           if (typeof msg.autoVerify === 'boolean') {
             patch[STORAGE_KEYS.autoVerify] = msg.autoVerify;
+          }
+          if (typeof msg.inlineHighlights === 'boolean') {
+            patch[STORAGE_KEYS.inlineHighlights] = msg.inlineHighlights;
           }
           await setSync(patch);
           sendResponse({ ok: true });

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Fact Guard",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "description": "Fact-checks Claude AI responses using your logged-in Perplexity tab (no API cost) or a Sonar API key, then pastes the literal correction back into Claude.",
   "minimum_chrome_version": "120",
   "icons": {

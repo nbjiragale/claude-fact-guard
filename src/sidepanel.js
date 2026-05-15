@@ -54,6 +54,7 @@ const els = {
   resetWebInstructions: document.getElementById('reset-web-instructions'),
   resetThread: document.getElementById('reset-thread'),
   autoVerifyToggle: document.getElementById('auto-verify-toggle'),
+  inlineHighlightsToggle: document.getElementById('inline-highlights-toggle'),
 
   // Session context (Settings view)
   contextInput: document.getElementById('context-input'),
@@ -197,6 +198,10 @@ function renderProviderUI() {
     }
     if (els.autoVerifyToggle) {
       els.autoVerifyToggle.checked = !!settings.autoVerify;
+    }
+    if (els.inlineHighlightsToggle) {
+      // Default ON: if the value isn't a literal `false`, treat as on.
+      els.inlineHighlightsToggle.checked = settings.inlineHighlights !== false;
     }
   } else {
     const stored =
@@ -435,6 +440,21 @@ els.autoVerifyToggle?.addEventListener('change', async () => {
   await sendBg({ type: 'SAVE_SETTINGS', autoVerify: next });
 });
 
+els.inlineHighlightsToggle?.addEventListener('change', async () => {
+  if (!state.settings) return;
+  const next = els.inlineHighlightsToggle.checked;
+  state.settings.inlineHighlights = next;
+  await sendBg({ type: 'SAVE_SETTINGS', inlineHighlights: next });
+  // If user turned the feature off, ask Claude's content script to tear
+  // down any highlights currently rendered.
+  if (!next) {
+    const claude = await getActiveClaudeTab();
+    if (claude.ok) {
+      await sendTab(claude.tab.id, { type: 'CLEAR_HIGHLIGHTS' });
+    }
+  }
+});
+
 els.saveSettings.addEventListener('click', async () => {
   flash(els.saveSettings, 'Saving…', true);
   const [settingsResp, contextResp] = await Promise.all([
@@ -447,6 +467,7 @@ els.saveSettings.addEventListener('click', async () => {
       webVisible: state.settings.webVisible,
       webCustomInstructions: state.settings.webCustomInstructions,
       autoVerify: !!state.settings.autoVerify,
+      inlineHighlights: state.settings.inlineHighlights !== false,
     }),
     sendBg({
       type: 'SET_CONTEXT',
