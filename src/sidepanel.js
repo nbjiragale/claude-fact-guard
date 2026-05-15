@@ -161,7 +161,19 @@ async function getActiveAITab() {
   return { ok: true, tab };
 }
 
-function sendTab(tabId, message) {
+// Chrome reports "Could not establish connection. Receiving end does
+// not exist." when sendMessage targets a tab whose content script
+// isn't loaded — typically because the AI chat tab existed BEFORE
+// the extension was installed / reloaded. manifest.json content
+// scripts don't retroactively attach to pre-existing tabs. When we
+// see this error we inject src/content.js on-demand and retry once,
+// which removes the "reload the tab" requirement entirely.
+function isMissingReceiverError(msg) {
+  if (!msg) return false;
+  return /Receiving end does not exist|Could not establish connection/i.test(msg);
+}
+
+function rawSendTab(tabId, message) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, message, (resp) => {
       if (chrome.runtime.lastError) {
@@ -176,6 +188,38 @@ function sendTab(tabId, message) {
       }
     });
   });
+}
+
+async function injectAITabContentScript(tabId) {
+  if (!chrome.scripting?.executeScript) {
+    return { ok: false, error: 'chrome.scripting unavailable.' };
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['src/content.js'],
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+async function sendTab(tabId, message) {
+  const first = await rawSendTab(tabId, message);
+  if (first.ok || !isMissingReceiverError(first.error)) return first;
+  const inject = await injectAITabContentScript(tabId);
+  if (!inject.ok) {
+    return {
+      ok: false,
+      error:
+        `Cannot attach content script to this tab (${inject.error}). ` +
+        'Reload the tab and try again.',
+    };
+  }
+  // Give the freshly-injected listener a tick to register before retry.
+  await new Promise((r) => setTimeout(r, 150));
+  return rawSendTab(tabId, message);
 }
 
 // ---------------------------------------------------------------------------

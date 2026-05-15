@@ -570,21 +570,60 @@ async function getOrCreatePerplexityTab({ visible }) {
   return { tabId: tab.id, fresh: true, seeded: false };
 }
 
-function sendToTab(tabId, message) {
+// Chrome surfaces "Could not establish connection. Receiving end does
+// not exist." when sendMessage targets a tab that has no listener —
+// i.e. the content script for that tab isn't loaded. The most common
+// trigger is a tab that existed BEFORE the extension was installed /
+// reloaded: content_scripts in manifest.json are not retroactively
+// injected into pre-existing tabs.
+function isMissingReceiverError(msg) {
+  if (!msg) return false;
+  return /Receiving end does not exist|Could not establish connection/i.test(msg);
+}
+
+function rawSendToTab(tabId, message) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, message, (resp) => {
       if (chrome.runtime.lastError) {
         resolve({
           ok: false,
-          error:
-            chrome.runtime.lastError.message ||
-            'No response from Perplexity tab. Reload the tab and retry.',
+          error: chrome.runtime.lastError.message || 'No response from tab.',
         });
       } else {
         resolve(resp || { ok: false, error: 'Empty response from content script.' });
       }
     });
   });
+}
+
+async function injectScriptInto(tabId, files) {
+  if (!chrome.scripting?.executeScript) {
+    return { ok: false, error: 'chrome.scripting unavailable.' };
+  }
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+async function sendToTab(tabId, message) {
+  const first = await rawSendToTab(tabId, message);
+  if (first.ok || !isMissingReceiverError(first.error)) return first;
+  // Receiving end missing — the Perplexity content script never
+  // attached (pre-existing tab, or extension was reloaded). Inject
+  // it via chrome.scripting and retry once.
+  const inject = await injectScriptInto(tabId, ['src/perplexity-content.js']);
+  if (!inject.ok) {
+    return {
+      ok: false,
+      error: `Could not attach Perplexity content script: ${inject.error}. Reload the Perplexity tab and retry.`,
+    };
+  }
+  // Give the freshly-injected script a tick to register its listener.
+  await new Promise((r) => setTimeout(r, 150));
+  return rawSendToTab(tabId, message);
 }
 
 async function waitForTabReady(tabId, timeoutMs = 60000) {
