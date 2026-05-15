@@ -14,6 +14,18 @@
         <button
           type="button"
           class="icon-btn"
+          id="compact-toggle"
+          aria-label="Collapse panel"
+          aria-pressed="false"
+          title="Collapse panel"
+        >
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 15l-6-6-6 6" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="icon-btn"
           id="kebab-btn"
           aria-label="Quick actions"
           aria-haspopup="menu"
@@ -93,25 +105,25 @@
             <span class="verdict-label" id="verdict-label"></span>
           </div>
 
-          <div id="issues-block" hidden>
-            <h3>Issues</h3>
+          <details id="issues-block" class="sub-card collapsible" data-key="issues" open hidden>
+            <summary>Issues</summary>
             <ul id="issues-list"></ul>
-          </div>
+          </details>
 
-          <div id="correction-block" hidden>
-            <h3>Correction to paste back into the chat</h3>
+          <details id="correction-block" class="sub-card collapsible" data-key="correction" open hidden>
+            <summary>Correction to paste back into the chat</summary>
             <pre id="correction-text"></pre>
             <div class="button-row">
               <button class="primary" id="paste-correction">Paste</button>
               <button class="primary" id="paste-send-correction">Paste &amp; send</button>
               <button class="ghost" id="copy-correction">Copy</button>
             </div>
-          </div>
+          </details>
 
-          <div id="citations-block" hidden>
-            <h3>Sources</h3>
+          <details id="citations-block" class="sub-card collapsible" data-key="citations" open hidden>
+            <summary>Sources</summary>
             <ol id="citations-list"></ol>
-          </div>
+          </details>
         </div>
       </section>
 

@@ -37,6 +37,9 @@ const els = {
   menuFreshThread: document.getElementById('menu-fresh-thread'),
   menuResetStats: document.getElementById('menu-reset-stats'),
 
+  // Compact-mode toggle (Home header)
+  compactToggle: document.getElementById('compact-toggle'),
+
   // Provider + web/api split (Settings view)
   webSettings: document.getElementById('web-settings'),
   apiSettings: document.getElementById('api-settings'),
@@ -688,9 +691,105 @@ async function updateTabWarning() {
 
 startWebStatusPolling();
 
+// ---------------------------------------------------------------------------
+// Collapsible side panel: compact mode + per-section <details> persistence
+//
+// State lives in chrome.storage.session so it survives the user closing /
+// re-opening the side panel within the same browser session but resets on
+// Chrome restart — which feels right for a transient UI preference. We use
+// session (not sync) so multiple devices don't fight over the panel layout.
+// ---------------------------------------------------------------------------
+
+const PANEL_LAYOUT_KEY = 'panelLayout';
+const DEFAULT_PANEL_LAYOUT = {
+  compact: false,
+  // Each key matches a [data-key] on a .collapsible <details> element.
+  sections: { issues: true, correction: true, citations: true },
+};
+
+let panelLayout = { ...DEFAULT_PANEL_LAYOUT };
+
+function applyCompactMode(on) {
+  document.body.classList.toggle('compact', !!on);
+  if (els.compactToggle) {
+    els.compactToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
+    const label = on ? 'Expand panel' : 'Collapse panel';
+    els.compactToggle.setAttribute('aria-label', label);
+    els.compactToggle.setAttribute('title', label);
+  }
+}
+
+function applySectionOpenState() {
+  const detailsEls = document.querySelectorAll('details.collapsible[data-key]');
+  detailsEls.forEach((d) => {
+    const key = d.getAttribute('data-key');
+    if (!key) return;
+    const open = panelLayout.sections?.[key];
+    // `open` undefined → fall back to the default (true) so first-run users
+    // see contents expanded; explicit `false` collapses, `true` opens.
+    if (open === false) d.removeAttribute('open');
+    else d.setAttribute('open', '');
+  });
+}
+
+function persistPanelLayout() {
+  try {
+    chrome.storage.session.set({ [PANEL_LAYOUT_KEY]: panelLayout });
+  } catch (_) {
+    /* session storage may be unavailable in old Chrome; ignore */
+  }
+}
+
+async function loadPanelLayout() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.session.get([PANEL_LAYOUT_KEY], (data) => {
+        const saved = data && data[PANEL_LAYOUT_KEY];
+        if (saved && typeof saved === 'object') {
+          panelLayout = {
+            compact: !!saved.compact,
+            sections: {
+              ...DEFAULT_PANEL_LAYOUT.sections,
+              ...(saved.sections || {}),
+            },
+          };
+        }
+        resolve();
+      });
+    } catch (_) {
+      resolve();
+    }
+  });
+}
+
+function wireCollapsibleHandlers() {
+  els.compactToggle?.addEventListener('click', () => {
+    panelLayout.compact = !panelLayout.compact;
+    applyCompactMode(panelLayout.compact);
+    persistPanelLayout();
+  });
+
+  // Listen for native <details> toggle events to persist open/closed state.
+  document
+    .querySelectorAll('details.collapsible[data-key]')
+    .forEach((d) => {
+      d.addEventListener('toggle', () => {
+        const key = d.getAttribute('data-key');
+        if (!key) return;
+        panelLayout.sections = panelLayout.sections || {};
+        panelLayout.sections[key] = d.open;
+        persistPanelLayout();
+      });
+    });
+}
+
 (async function init() {
   const manifest = chrome.runtime.getManifest();
   els.versionLabel.textContent = `v${manifest.version}`;
+  await loadPanelLayout();
+  applyCompactMode(panelLayout.compact);
+  applySectionOpenState();
+  wireCollapsibleHandlers();
   await refreshState();
   updateTabWarning();
 })();

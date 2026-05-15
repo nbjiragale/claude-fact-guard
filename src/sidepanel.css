@@ -540,6 +540,26 @@ select {
   margin-bottom: 8px;
 }
 
+/* ---------------- Compact mode ----------------
+ * Toggled via the chevron in the home header. Hides the result card,
+ * the stats bar, and the tab warning so the panel collapses down to
+ * just the Verify button + status row. The chevron rotates 180° so
+ * its meaning flips from "collapse" to "expand".
+ */
+body.compact #result-card,
+body.compact .stats-bar,
+body.compact .tab-warning {
+  display: none !important;
+}
+
+#compact-toggle svg {
+  transition: transform 180ms ease;
+}
+
+body.compact #compact-toggle svg {
+  transform: rotate(180deg);
+}
+
 /* ---------------- Buttons ---------------- */
 
 button {
