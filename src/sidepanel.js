@@ -37,8 +37,8 @@ const els = {
   menuFreshThread: document.getElementById('menu-fresh-thread'),
   menuResetStats: document.getElementById('menu-reset-stats'),
 
-  // Compact-mode toggle (Home header)
-  compactToggle: document.getElementById('compact-toggle'),
+  // Close-panel button (Home header)
+  closePanelBtn: document.getElementById('close-panel-btn'),
 
   // Provider + web/api split (Settings view)
   webSettings: document.getElementById('web-settings'),
@@ -692,67 +692,51 @@ async function updateTabWarning() {
 startWebStatusPolling();
 
 // ---------------------------------------------------------------------------
-// Collapsible side panel: compact mode + per-section <details> persistence
+// Close-panel button + per-section <details> persistence
 //
-// State lives in chrome.storage.session so it survives the user closing /
-// re-opening the side panel within the same browser session but resets on
-// Chrome restart — which feels right for a transient UI preference. We use
-// session (not sync) so multiple devices don't fight over the panel layout.
+// The header X button calls window.close() which fully collapses the
+// Chrome side panel for the current window. Reopening is handled by the
+// toolbar action (background.js sets openPanelOnActionClick: true), so
+// the user just clicks the extension icon in the toolbar to bring the
+// panel back.
+//
+// Separately, the Issues / Correction / Sources <details> sections
+// inside the result card persist their open/closed state across panel
+// re-opens via chrome.storage.session.
 // ---------------------------------------------------------------------------
 
 const PANEL_LAYOUT_KEY = 'panelLayout';
-const DEFAULT_PANEL_LAYOUT = {
-  compact: false,
-  // Each key matches a [data-key] on a .collapsible <details> element.
-  sections: { issues: true, correction: true, citations: true },
-};
+const DEFAULT_SECTIONS = { issues: true, correction: true, citations: true };
 
-let panelLayout = { ...DEFAULT_PANEL_LAYOUT };
-
-function applyCompactMode(on) {
-  document.body.classList.toggle('compact', !!on);
-  if (els.compactToggle) {
-    els.compactToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
-    const label = on ? 'Expand panel' : 'Collapse panel';
-    els.compactToggle.setAttribute('aria-label', label);
-    els.compactToggle.setAttribute('title', label);
-  }
-}
+let panelSections = { ...DEFAULT_SECTIONS };
 
 function applySectionOpenState() {
-  const detailsEls = document.querySelectorAll('details.collapsible[data-key]');
-  detailsEls.forEach((d) => {
+  document.querySelectorAll('details.collapsible[data-key]').forEach((d) => {
     const key = d.getAttribute('data-key');
     if (!key) return;
-    const open = panelLayout.sections?.[key];
-    // `open` undefined → fall back to the default (true) so first-run users
-    // see contents expanded; explicit `false` collapses, `true` opens.
+    const open = panelSections[key];
     if (open === false) d.removeAttribute('open');
     else d.setAttribute('open', '');
   });
 }
 
-function persistPanelLayout() {
+function persistPanelSections() {
   try {
-    chrome.storage.session.set({ [PANEL_LAYOUT_KEY]: panelLayout });
+    chrome.storage.session.set({
+      [PANEL_LAYOUT_KEY]: { sections: panelSections },
+    });
   } catch (_) {
     /* session storage may be unavailable in old Chrome; ignore */
   }
 }
 
-async function loadPanelLayout() {
+async function loadPanelSections() {
   return new Promise((resolve) => {
     try {
       chrome.storage.session.get([PANEL_LAYOUT_KEY], (data) => {
         const saved = data && data[PANEL_LAYOUT_KEY];
-        if (saved && typeof saved === 'object') {
-          panelLayout = {
-            compact: !!saved.compact,
-            sections: {
-              ...DEFAULT_PANEL_LAYOUT.sections,
-              ...(saved.sections || {}),
-            },
-          };
+        if (saved && typeof saved === 'object' && saved.sections) {
+          panelSections = { ...DEFAULT_SECTIONS, ...saved.sections };
         }
         resolve();
       });
@@ -763,22 +747,26 @@ async function loadPanelLayout() {
 }
 
 function wireCollapsibleHandlers() {
-  els.compactToggle?.addEventListener('click', () => {
-    panelLayout.compact = !panelLayout.compact;
-    applyCompactMode(panelLayout.compact);
-    persistPanelLayout();
+  // Close the entire side panel. Chrome's Side Panel API lets the panel
+  // close itself via window.close(); the toolbar icon is the one-click
+  // way back in (background.js: setPanelBehavior({ openPanelOnActionClick: true })).
+  els.closePanelBtn?.addEventListener('click', () => {
+    try {
+      window.close();
+    } catch (_) {
+      /* should never throw in a side-panel context */
+    }
   });
 
-  // Listen for native <details> toggle events to persist open/closed state.
+  // Persist native <details> toggle state.
   document
     .querySelectorAll('details.collapsible[data-key]')
     .forEach((d) => {
       d.addEventListener('toggle', () => {
         const key = d.getAttribute('data-key');
         if (!key) return;
-        panelLayout.sections = panelLayout.sections || {};
-        panelLayout.sections[key] = d.open;
-        persistPanelLayout();
+        panelSections[key] = d.open;
+        persistPanelSections();
       });
     });
 }
@@ -786,8 +774,7 @@ function wireCollapsibleHandlers() {
 (async function init() {
   const manifest = chrome.runtime.getManifest();
   els.versionLabel.textContent = `v${manifest.version}`;
-  await loadPanelLayout();
-  applyCompactMode(panelLayout.compact);
+  await loadPanelSections();
   applySectionOpenState();
   wireCollapsibleHandlers();
   await refreshState();
