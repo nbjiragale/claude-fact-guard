@@ -81,6 +81,13 @@
   box-sizing: border-box;
 }
 
+/* The `hidden` attribute must always win over any author rule that sets
+ * `display: flex` (e.g. on #home-view / #settings-view / .header / .kebab-menu).
+ * Without this, both Home and Settings render simultaneously. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
