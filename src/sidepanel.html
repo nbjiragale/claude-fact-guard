@@ -20,44 +20,113 @@
     <details class="card" id="settings-card" open>
       <summary>
         <span class="card-title">Settings</span>
-        <span class="card-sub" id="settings-summary">Perplexity Sonar · no key</span>
+        <span class="card-sub" id="settings-summary">Perplexity Web (your tab)</span>
       </summary>
       <div class="card-body">
         <label class="field">
           <span>Provider</span>
-          <div class="radio-row">
+          <div class="radio-col">
+            <label class="radio">
+              <input type="radio" name="provider" value="perplexity-web" />
+              <span class="radio-main">Perplexity Web (your tab)</span>
+              <span class="radio-sub">Free — rides on your logged-in Perplexity Pro</span>
+            </label>
             <label class="radio">
               <input type="radio" name="provider" value="perplexity" />
-              Perplexity (direct)
+              <span class="radio-main">Perplexity API (direct)</span>
+              <span class="radio-sub">Sonar via your API key</span>
             </label>
             <label class="radio">
               <input type="radio" name="provider" value="openrouter" />
-              OpenRouter
+              <span class="radio-main">OpenRouter</span>
+              <span class="radio-sub">Sonar via OpenRouter API key</span>
             </label>
           </div>
         </label>
 
-        <label class="field">
-          <span>API key</span>
-          <input
-            type="password"
-            id="api-key"
-            placeholder="pplx-..."
-            autocomplete="off"
-            spellcheck="false"
-          />
-          <p class="hint" id="api-key-hint">
-            Get one at
-            <a id="api-key-link" href="https://www.perplexity.ai/settings/api" target="_blank" rel="noreferrer noopener">Perplexity API settings</a>.
-            Stored in <code>chrome.storage.sync</code>. Sent only to the chosen
-            provider's API endpoint.
-          </p>
-        </label>
+        <div id="web-settings">
+          <div class="field">
+            <span>Perplexity tab</span>
+            <div class="tab-status">
+              <span class="status-dot" id="web-status-dot"></span>
+              <span id="web-status-label">Not opened yet</span>
+              <button class="ghost small" id="open-perplexity-tab" type="button">Open / focus</button>
+            </div>
+            <p class="hint">
+              The extension drives this tab to ask Perplexity for fact-checks.
+              You must stay signed in to Perplexity. Each Verify uses one of
+              your Pro searches (300/day on Pro).
+            </p>
+          </div>
 
-        <label class="field">
-          <span>Model</span>
-          <select id="model-select"></select>
-        </label>
+          <div class="field">
+            <span>Tab visibility</span>
+            <div class="radio-row">
+              <label class="radio inline">
+                <input type="radio" name="web-visible" value="true" />
+                Visible
+              </label>
+              <label class="radio inline">
+                <input type="radio" name="web-visible" value="false" />
+                Hidden (pinned)
+              </label>
+            </div>
+            <p class="hint">
+              Visible: you can see Perplexity's full answer + sources in the
+              tab. Hidden: pinned, runs in the background.
+            </p>
+          </div>
+
+          <details class="sub-card">
+            <summary>Custom instructions (advanced)</summary>
+            <p class="hint">
+              Sent as the FIRST message of every new Perplexity thread to set
+              the fact-checker's posture. Leave the default unless you want to
+              relax / tighten how strict it is.
+            </p>
+            <textarea
+              id="web-custom-instructions"
+              rows="8"
+              spellcheck="false"
+            ></textarea>
+            <div class="button-row">
+              <button class="ghost small" id="reset-web-instructions" type="button">Reset to default</button>
+            </div>
+          </details>
+
+          <div class="field">
+            <button class="secondary" id="reset-thread" type="button">Start a fresh Perplexity thread</button>
+            <p class="hint">
+              The current thread carries your context across every Verify in
+              this session. Click this to forget it and start a new one (e.g.
+              when switching to a different interview topic).
+            </p>
+          </div>
+        </div>
+
+        <div id="api-settings" hidden>
+          <label class="field">
+            <span>API key</span>
+            <input
+              type="password"
+              id="api-key"
+              placeholder="pplx-..."
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <p class="hint" id="api-key-hint">
+              Get one at
+              <a id="api-key-link" href="https://www.perplexity.ai/settings/api" target="_blank" rel="noreferrer noopener">Perplexity API settings</a>.
+              Stored in <code>chrome.storage.sync</code>. Sent only to the chosen
+              provider's API endpoint.
+            </p>
+          </label>
+
+          <label class="field">
+            <span>Model</span>
+            <select id="model-select"></select>
+          </label>
+        </div>
 
         <button class="primary" id="save-settings">Save settings</button>
       </div>
@@ -71,8 +140,8 @@
       <div class="card-body">
         <p class="hint">
           Paste what you're studying / interviewing for (topic, level, scope).
-          It's prepended to every fact-check so Sonar judges Claude's answers
-          against the right reference frame.
+          On the Perplexity Web provider it's loaded once at the start of a
+          thread; on the API providers it's prepended to every fact-check.
         </p>
         <textarea
           id="context-input"
@@ -93,9 +162,13 @@
         <button class="primary big" id="verify-btn">
           Verify latest Claude response
         </button>
+        <button class="ghost small" id="reverify-btn" type="button" hidden>
+          Re-verify (force, will use a new Pro search)
+        </button>
         <div class="status-row">
           <span class="status-dot" id="status-dot"></span>
           <span class="status-label" id="status-label">Idle</span>
+          <span class="cache-flag" id="cache-flag" hidden>cached</span>
         </div>
         <p class="status-error" id="status-error" hidden></p>
       </div>

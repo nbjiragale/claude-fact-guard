@@ -6,10 +6,16 @@
 
 const STATUS_LABELS = {
   idle: 'Idle',
-  checking: 'Checking with Perplexity Sonar…',
+  checking: 'Checking with Perplexity…',
   accurate: 'Accurate',
   inaccurate: 'Inaccurate — see correction below',
   error: 'Verification error',
+};
+
+const PROVIDER_KIND = {
+  'perplexity-web': 'web',
+  perplexity: 'api',
+  openrouter: 'api',
 };
 
 const els = {
@@ -19,11 +25,21 @@ const els = {
   // Settings
   settingsCard: document.getElementById('settings-card'),
   settingsSummary: document.getElementById('settings-summary'),
+  webSettings: document.getElementById('web-settings'),
+  apiSettings: document.getElementById('api-settings'),
   apiKey: document.getElementById('api-key'),
   apiKeyHint: document.getElementById('api-key-hint'),
   apiKeyLink: document.getElementById('api-key-link'),
   modelSelect: document.getElementById('model-select'),
   saveSettings: document.getElementById('save-settings'),
+
+  // Web provider
+  webStatusDot: document.getElementById('web-status-dot'),
+  webStatusLabel: document.getElementById('web-status-label'),
+  openPerplexityTab: document.getElementById('open-perplexity-tab'),
+  webCustomInstructions: document.getElementById('web-custom-instructions'),
+  resetWebInstructions: document.getElementById('reset-web-instructions'),
+  resetThread: document.getElementById('reset-thread'),
 
   // Context
   contextCard: document.getElementById('context-card'),
@@ -36,9 +52,11 @@ const els = {
 
   // Verify
   verifyBtn: document.getElementById('verify-btn'),
+  reverifyBtn: document.getElementById('reverify-btn'),
   statusDot: document.getElementById('status-dot'),
   statusLabel: document.getElementById('status-label'),
   statusError: document.getElementById('status-error'),
+  cacheFlag: document.getElementById('cache-flag'),
 
   // Result
   resultCard: document.getElementById('result-card'),
@@ -121,38 +139,77 @@ function sendTab(tabId, message) {
 function renderProviderUI() {
   const { providers, settings } = state;
   const cfg = providers[settings.provider];
+  const kind = PROVIDER_KIND[settings.provider] || 'api';
 
   // Radio buttons
   document.querySelectorAll('input[name="provider"]').forEach((el) => {
     el.checked = el.value === settings.provider;
   });
 
-  // API key field
-  const stored =
-    settings.provider === 'perplexity'
-      ? settings.perplexityKey
-      : settings.openrouterKey;
-  els.apiKey.value = stored || '';
-  els.apiKey.placeholder = stored ? 'API key saved' : cfg.keyHint;
-  els.apiKeyLink.href = cfg.keyHelpUrl;
-  els.apiKeyLink.textContent =
-    settings.provider === 'perplexity'
-      ? 'Perplexity API settings'
-      : 'OpenRouter API keys';
+  // Show / hide web vs api sub-sections
+  els.webSettings.hidden = kind !== 'web';
+  els.apiSettings.hidden = kind === 'web';
 
-  // Models dropdown
-  els.modelSelect.innerHTML = '';
-  for (const m of cfg.models) {
-    const opt = document.createElement('option');
-    opt.value = m.id;
-    opt.textContent = m.label;
-    els.modelSelect.appendChild(opt);
+  if (kind === 'web') {
+    // Web settings
+    document.querySelectorAll('input[name="web-visible"]').forEach((el) => {
+      el.checked = String(settings.webVisible) === el.value;
+    });
+    if (
+      document.activeElement !== els.webCustomInstructions &&
+      els.webCustomInstructions.value !== settings.webCustomInstructions
+    ) {
+      els.webCustomInstructions.value = settings.webCustomInstructions || '';
+    }
+    els.settingsSummary.textContent = `${cfg.label} · ${settings.webVisible ? 'visible' : 'hidden'} tab`;
+  } else {
+    // API settings
+    const stored =
+      settings.provider === 'perplexity'
+        ? settings.perplexityKey
+        : settings.openrouterKey;
+    els.apiKey.value = stored || '';
+    els.apiKey.placeholder = stored ? 'API key saved' : cfg.keyHint;
+    els.apiKeyLink.href = cfg.keyHelpUrl;
+    els.apiKeyLink.textContent =
+      settings.provider === 'perplexity'
+        ? 'Perplexity API settings'
+        : 'OpenRouter API keys';
+
+    els.modelSelect.innerHTML = '';
+    for (const m of cfg.models) {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.label;
+      els.modelSelect.appendChild(opt);
+    }
+    els.modelSelect.value = settings.model;
+
+    const hasKey = !!stored;
+    els.settingsSummary.textContent = `${cfg.label} · ${settings.model} · ${hasKey ? 'key saved' : 'no key'}`;
   }
-  els.modelSelect.value = settings.model;
+}
 
-  // Summary text on collapsed card
-  const hasKey = !!stored;
-  els.settingsSummary.textContent = `${cfg.label} · ${settings.model} · ${hasKey ? 'key saved' : 'no key'}`;
+async function renderWebStatus() {
+  if (state.settings?.provider !== 'perplexity-web') return;
+  const resp = await sendBg({ type: 'PERPLEXITY_WEB_STATUS' });
+  if (!resp.ok) {
+    els.webStatusDot.className = 'status-dot';
+    els.webStatusLabel.textContent = 'Status unavailable';
+    return;
+  }
+  if (!resp.alive) {
+    els.webStatusDot.className = 'status-dot';
+    els.webStatusLabel.textContent = 'No Perplexity tab — will open on first Verify';
+  } else if (resp.loggedIn === false) {
+    els.webStatusDot.className = 'status-dot error';
+    els.webStatusLabel.textContent = 'Tab open but signed out — sign in to Perplexity';
+  } else {
+    els.webStatusDot.className = 'status-dot accurate';
+    els.webStatusLabel.textContent = resp.seeded
+      ? 'Connected · thread active (context loaded)'
+      : 'Connected · fresh thread';
+  }
 }
 
 function renderContextUI() {
@@ -184,6 +241,8 @@ function renderStats() {
   }
 
   renderVerdict(s.lastVerdict);
+  // Re-verify button is only visible when we have a verdict to re-verify.
+  els.reverifyBtn.hidden = !s.lastVerdict;
 }
 
 function renderVerdict(verdict) {
@@ -256,7 +315,43 @@ document.querySelectorAll('input[name="provider"]').forEach((el) => {
       state.settings.model = cfg.defaultModel;
     }
     renderProviderUI();
+    renderWebStatus();
   });
+});
+
+document.querySelectorAll('input[name="web-visible"]').forEach((el) => {
+  el.addEventListener('change', () => {
+    if (!state.settings) return;
+    state.settings.webVisible = el.value === 'true';
+  });
+});
+
+els.webCustomInstructions?.addEventListener('input', () => {
+  if (!state.settings) return;
+  state.settings.webCustomInstructions = els.webCustomInstructions.value;
+});
+
+els.resetWebInstructions?.addEventListener('click', async () => {
+  // Send empty string — background resolves it to the built-in default.
+  await sendBg({
+    type: 'SAVE_SETTINGS',
+    webCustomInstructions: '',
+  });
+  await refreshState();
+  flash(els.resetWebInstructions, 'Reset');
+});
+
+els.resetThread?.addEventListener('click', async () => {
+  flash(els.resetThread, 'Resetting…', true);
+  await sendBg({ type: 'RESET_PERPLEXITY_THREAD' });
+  await refreshState();
+  await renderWebStatus();
+  flash(els.resetThread, 'Fresh thread ready');
+});
+
+els.openPerplexityTab?.addEventListener('click', async () => {
+  await sendBg({ type: 'OPEN_PERPLEXITY_TAB' });
+  await renderWebStatus();
 });
 
 els.modelSelect.addEventListener('change', () => {
@@ -264,12 +359,14 @@ els.modelSelect.addEventListener('change', () => {
 });
 
 els.apiKey.addEventListener('input', () => {
+  if (!state.settings) return;
   const key = els.apiKey.value;
   if (state.settings.provider === 'perplexity') {
     state.settings.perplexityKey = key;
-  } else {
+  } else if (state.settings.provider === 'openrouter') {
     state.settings.openrouterKey = key;
   }
+  // Ignore inputs while on the web provider (the field is hidden).
 });
 
 els.saveSettings.addEventListener('click', async () => {
@@ -280,9 +377,12 @@ els.saveSettings.addEventListener('click', async () => {
     perplexityKey: state.settings.perplexityKey,
     openrouterKey: state.settings.openrouterKey,
     model: state.settings.model,
+    webVisible: state.settings.webVisible,
+    webCustomInstructions: state.settings.webCustomInstructions,
   });
   if (resp.ok) {
     await refreshState();
+    await renderWebStatus();
     flash(els.saveSettings, 'Saved');
   } else {
     flash(els.saveSettings, 'Failed');
@@ -338,10 +438,12 @@ async function pasteContextHelper(send) {
 els.pasteContext.addEventListener('click', () => pasteContextHelper(false));
 els.pasteSendContext.addEventListener('click', () => pasteContextHelper(true));
 
-els.verifyBtn.addEventListener('click', async () => {
+async function runVerify({ force }) {
   els.statusError.hidden = true;
   els.statusError.textContent = '';
+  els.cacheFlag.hidden = true;
   els.verifyBtn.disabled = true;
+  els.reverifyBtn.disabled = true;
   els.statusDot.className = 'status-dot checking';
   els.statusLabel.textContent = STATUS_LABELS.checking;
 
@@ -364,18 +466,29 @@ els.verifyBtn.addEventListener('click', async () => {
       return;
     }
 
-    const verifyResp = await sendBg({ type: 'VERIFY', text: latest.text });
+    const verifyResp = await sendBg({
+      type: 'VERIFY',
+      text: latest.text,
+      force: !!force,
+    });
     if (!verifyResp.ok) {
       els.statusError.hidden = false;
       els.statusError.textContent = verifyResp.error || 'Verification failed.';
+    } else if (verifyResp.fromCache) {
+      els.cacheFlag.hidden = false;
     }
     // The background already wrote stats + verdict to session storage, which
     // the storage listener picks up to refresh the UI.
     await refreshState();
+    await renderWebStatus();
   } finally {
     els.verifyBtn.disabled = false;
+    els.reverifyBtn.disabled = false;
   }
-});
+}
+
+els.verifyBtn.addEventListener('click', () => runVerify({ force: false }));
+els.reverifyBtn.addEventListener('click', () => runVerify({ force: true }));
 
 async function injectCorrection(send) {
   const text = (els.correctionText.textContent || '').trim();
@@ -456,10 +569,22 @@ async function refreshState() {
   renderStats();
 }
 
+let webStatusTimer = null;
+function startWebStatusPolling() {
+  if (webStatusTimer) return;
+  webStatusTimer = setInterval(() => {
+    if (state.settings?.provider === 'perplexity-web') {
+      renderWebStatus();
+    }
+  }, 5000);
+}
+
 async function updateTabWarning() {
   const tabResp = await getActiveClaudeTab();
   els.tabWarning.hidden = tabResp.ok;
 }
+
+startWebStatusPolling();
 
 (async function init() {
   const manifest = chrome.runtime.getManifest();
