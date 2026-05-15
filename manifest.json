@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Claude Fact Guard",
-  "version": "3.0.0",
-  "description": "Fact-checks Claude AI responses using your logged-in Perplexity tab (no API cost) or a Sonar API key, then pastes the literal correction back into Claude.",
+  "version": "3.4.0",
+  "description": "Fact-checks Claude and ChatGPT responses using your logged-in Perplexity tab (no API cost) or a Sonar API key, then pastes the literal correction back into the chat.",
   "minimum_chrome_version": "120",
   "icons": {
     "16": "icons/icon-16.png",
@@ -26,7 +26,11 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://claude.ai/*"],
+      "matches": [
+        "https://claude.ai/*",
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
       "js": ["src/content.js"],
       "run_at": "document_idle",
       "all_frames": false
@@ -41,6 +45,8 @@
   "permissions": ["storage", "sidePanel", "scripting", "activeTab", "tabs"],
   "host_permissions": [
     "https://claude.ai/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
     "https://www.perplexity.ai/*",
     "https://perplexity.ai/*",
     "https://api.perplexity.ai/*",

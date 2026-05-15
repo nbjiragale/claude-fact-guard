@@ -1,14 +1,17 @@
 # Claude Fact Guard
 
-A Chrome extension that fact-checks Claude AI responses and pastes a
-literal correction back into Claude — on demand, from a side panel.
+A Chrome extension that fact-checks Claude AI **and ChatGPT** responses
+and pastes a literal correction back into the chat — on demand or
+automatically, from a side panel, with optional Grammarly-style inline
+highlights of the wrong claims.
 
-Built for interview prep and other learning sessions where Claude's
+Built for interview prep and other learning sessions where AI
 hallucinations are unacceptable, and where you want a *second opinion*
 on every claim before you internalize it.
 
-> **Status:** v3.0 — Perplexity Web (your tab) is the default provider.
-> Perplexity API and OpenRouter remain as paid alternatives.
+> **Status:** v3.4 — Perplexity Web (your tab) is the default provider.
+> Claude.ai and ChatGPT.com are both supported. Perplexity API and
+> OpenRouter remain as paid alternatives.
 
 ---
 
@@ -20,10 +23,11 @@ fabricated dates, wrong attribution) with high confidence. Claude's built-in
 web search drains the free-tier token budget when you flip it on for every
 message.
 
-Claude Fact Guard solves this by routing **only the latest Claude response**
-— when *you* click Verify — through a fact-checker that you trust. The
-default flow uses your **already-paid Perplexity Pro tab** as the
-fact-checker, so the extension itself costs $0/month.
+Claude Fact Guard solves this by routing **only the latest assistant
+response** (from Claude or ChatGPT) — when *you* click Verify, or
+automatically when Auto-verify is on — through a fact-checker that you
+trust. The default flow uses your **already-paid Perplexity Pro tab** as
+the fact-checker, so the extension itself costs $0/month.
 
 The correction is phrased as a plain fact:
 
@@ -109,8 +113,9 @@ the JSON verdict, and surface it identically in the UI.
    - Make sure you have a Perplexity Pro subscription.
    - Click **Open / focus** in the side panel; sign in to Perplexity in
      the tab that opens.
-   - Done. Open [claude.ai](https://claude.ai) and hit
-     **Verify latest Claude response**.
+   - Done. Open [claude.ai](https://claude.ai) or
+     [chatgpt.com](https://chatgpt.com) and hit
+     **Verify latest AI response**.
 7. **Alternate providers — Perplexity API / OpenRouter:**
    - In Settings, switch the radio to Perplexity API or OpenRouter.
    - Paste your API key:
@@ -221,8 +226,8 @@ they can be patched in one place when either UI changes.
 - The extension does not contact any other server, has no analytics, and
   has no remote code.
 - Permissions: `storage`, `sidePanel`, `scripting`, `activeTab`, `tabs`,
-  and host permissions for `claude.ai`, `*.perplexity.ai`, and
-  `openrouter.ai`.
+  and host permissions for `claude.ai`, `chatgpt.com`,
+  `chat.openai.com`, `*.perplexity.ai`, and `openrouter.ai`.
 
 See [PRIVACY.md](PRIVACY.md) for the full policy.
 

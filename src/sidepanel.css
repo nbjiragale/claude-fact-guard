@@ -81,6 +81,13 @@
   box-sizing: border-box;
 }
 
+/* The `hidden` attribute must always win over any author rule that sets
+ * `display: flex` (e.g. on #home-view / #settings-view / .header / .kebab-menu).
+ * Without this, both Home and Settings render simultaneously. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
@@ -117,9 +124,91 @@ a:hover {
 .header {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   padding: 2px 2px 6px;
+  position: relative;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.icon-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease;
+}
+
+.icon-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.icon-btn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.icon-btn.back-btn {
+  color: var(--text);
+  margin-right: 4px;
+}
+
+#settings-header h1 {
+  flex: 1;
+  font-size: 17px;
+}
+
+#settings-header h1::before {
+  content: none;
+}
+
+.kebab-menu {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  margin-top: 4px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  min-width: 220px;
+  padding: 4px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+}
+
+.kebab-menu button {
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 8px 10px;
+  font: inherit;
+  color: var(--text);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.kebab-menu button:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 h1 {
@@ -451,6 +540,16 @@ select {
   margin-bottom: 8px;
 }
 
+/* ---------------- Close-panel button ----------------
+ * The header X button calls window.close() to fully collapse the
+ * Chrome side panel. Reopening is handled by clicking the toolbar
+ * icon (the action.onClicked path in background.js reopens the panel
+ * via chrome.sidePanel.open).
+ */
+#close-panel-btn:hover svg {
+  color: var(--danger);
+}
+
 /* ---------------- Buttons ---------------- */
 
 button {
@@ -778,6 +877,78 @@ footer a:hover {
   border-bottom-color: var(--border-strong);
 }
 
+/* ---------------- View layout (Home / Settings split) ---------------- */
+
+#home-view,
+#settings-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ---------------- Compact stats bar (Home) ---------------- */
+
+.stats-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 2px;
+}
+
+.stat-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.stat-pill strong {
+  font-family: var(--font-serif);
+  font-weight: 500;
+  font-size: 14px;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+/* ---------------- Settings view footer ---------------- */
+
+.settings-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px;
+}
+
+.settings-footer .primary {
+  flex: 1;
+}
+
+.settings-meta {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 0 2px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.settings-meta a {
+  color: var(--muted);
+  border-bottom: 1px solid transparent;
+}
+
+.settings-meta a:hover {
+  color: var(--text);
+  border-bottom-color: var(--border-strong);
+}
+
 /* ---------------- Misc ---------------- */
 
 code {
@@ -801,4 +972,92 @@ code {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--muted);
+}
+
+/* -------------------------------------------------------------------------
+ * Auto-verify toggle
+ * --------------------------------------------------------------------- */
+
+.auto-verify-field {
+  padding-top: 14px;
+  border-top: 1px solid var(--border-strong);
+}
+
+.toggle-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+}
+
+.toggle-row .toggle-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 auto;
+}
+
+.toggle-row .toggle-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.toggle-row .toggle-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.toggle {
+  position: relative;
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.toggle input[type="checkbox"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  z-index: 1;
+}
+
+.toggle-slider {
+  display: inline-block;
+  width: 34px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--border-strong);
+  position: relative;
+  transition: background 0.16s ease;
+}
+
+.toggle-slider::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+  transition: transform 0.16s ease;
+}
+
+.toggle input[type="checkbox"]:checked + .toggle-slider {
+  background: var(--accent);
+}
+
+.toggle input[type="checkbox"]:checked + .toggle-slider::after {
+  transform: translateX(14px);
+}
+
+.toggle input[type="checkbox"]:focus-visible + .toggle-slider {
+  outline: 3px solid var(--accent-soft);
+  outline-offset: 2px;
 }

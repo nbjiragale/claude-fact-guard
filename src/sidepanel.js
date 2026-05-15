@@ -1,8 +1,9 @@
 // Claude Fact Guard — side panel script
 //
-// Renders settings, the Set Context flow, the Verify button, and the
-// fact-check verdict. All API calls and storage live in the background
-// service worker; the panel just dispatches messages.
+// Renders the clean Home view (Verify + result + stats) and a separate
+// Settings view (provider, web/api config, session context). All API calls
+// and storage live in the background service worker; the panel just
+// dispatches messages.
 
 const STATUS_LABELS = {
   idle: 'Idle',
@@ -22,9 +23,24 @@ const els = {
   versionLabel: document.getElementById('version-label'),
   tabWarning: document.getElementById('tab-warning'),
 
-  // Settings
-  settingsCard: document.getElementById('settings-card'),
-  settingsSummary: document.getElementById('settings-summary'),
+  // View / header switching
+  homeView: document.getElementById('home-view'),
+  settingsView: document.getElementById('settings-view'),
+  homeHeader: document.getElementById('home-header'),
+  settingsHeader: document.getElementById('settings-header'),
+  openSettingsBtn: document.getElementById('open-settings-btn'),
+  closeSettingsBtn: document.getElementById('close-settings-btn'),
+
+  // Kebab menu (Home header)
+  kebabBtn: document.getElementById('kebab-btn'),
+  kebabMenu: document.getElementById('kebab-menu'),
+  menuFreshThread: document.getElementById('menu-fresh-thread'),
+  menuResetStats: document.getElementById('menu-reset-stats'),
+
+  // Close-panel button (Home header)
+  closePanelBtn: document.getElementById('close-panel-btn'),
+
+  // Provider + web/api split (Settings view)
   webSettings: document.getElementById('web-settings'),
   apiSettings: document.getElementById('api-settings'),
   apiKey: document.getElementById('api-key'),
@@ -33,24 +49,21 @@ const els = {
   modelSelect: document.getElementById('model-select'),
   saveSettings: document.getElementById('save-settings'),
 
-  // Web provider
+  // Web provider controls (Settings view)
   webStatusDot: document.getElementById('web-status-dot'),
   webStatusLabel: document.getElementById('web-status-label'),
   openPerplexityTab: document.getElementById('open-perplexity-tab'),
   webCustomInstructions: document.getElementById('web-custom-instructions'),
   resetWebInstructions: document.getElementById('reset-web-instructions'),
   resetThread: document.getElementById('reset-thread'),
+  autoVerifyToggle: document.getElementById('auto-verify-toggle'),
+  inlineHighlightsToggle: document.getElementById('inline-highlights-toggle'),
 
-  // Context
-  contextCard: document.getElementById('context-card'),
-  contextSummary: document.getElementById('context-summary'),
+  // Session context (Settings view)
   contextInput: document.getElementById('context-input'),
-  saveContext: document.getElementById('save-context'),
-  pasteContext: document.getElementById('paste-context'),
-  pasteSendContext: document.getElementById('paste-send-context'),
   contextStatus: document.getElementById('context-status'),
 
-  // Verify
+  // Verify (Home view)
   verifyBtn: document.getElementById('verify-btn'),
   reverifyBtn: document.getElementById('reverify-btn'),
   statusDot: document.getElementById('status-dot'),
@@ -58,7 +71,7 @@ const els = {
   statusError: document.getElementById('status-error'),
   cacheFlag: document.getElementById('cache-flag'),
 
-  // Result
+  // Result (Home view)
   resultCard: document.getElementById('result-card'),
   verdictBadge: document.getElementById('verdict-badge'),
   verdictLabel: document.getElementById('verdict-label'),
@@ -72,11 +85,10 @@ const els = {
   citationsBlock: document.getElementById('citations-block'),
   citationsList: document.getElementById('citations-list'),
 
-  // Stats
+  // Stats (Home view, compact pills)
   statVerifications: document.getElementById('stat-verifications'),
   statInaccurate: document.getElementById('stat-inaccurate'),
   statErrors: document.getElementById('stat-errors'),
-  resetStats: document.getElementById('reset-stats'),
 };
 
 let state = {
@@ -84,6 +96,35 @@ let state = {
   settings: null,
   stats: null,
 };
+
+// ---------------------------------------------------------------------------
+// View switching
+// ---------------------------------------------------------------------------
+
+function showView(name) {
+  const isSettings = name === 'settings';
+  els.homeView.hidden = isSettings;
+  els.settingsView.hidden = !isSettings;
+  els.homeHeader.hidden = isSettings;
+  els.settingsHeader.hidden = !isSettings;
+  if (isSettings) closeKebabMenu();
+}
+
+function openKebabMenu() {
+  els.kebabMenu.hidden = false;
+  els.kebabBtn.setAttribute('aria-expanded', 'true');
+}
+
+function closeKebabMenu() {
+  els.kebabMenu.hidden = true;
+  els.kebabBtn.setAttribute('aria-expanded', 'false');
+}
+
+document.addEventListener('click', (e) => {
+  if (els.kebabMenu.hidden) return;
+  if (e.target.closest('#kebab-menu') || e.target.closest('#kebab-btn')) return;
+  closeKebabMenu();
+});
 
 // ---------------------------------------------------------------------------
 // Messaging helpers
@@ -101,7 +142,12 @@ function sendBg(message) {
   });
 }
 
-async function getActiveClaudeTab() {
+// URL patterns for every supported AI assistant tab. Adding a new host
+// (e.g. Gemini) means: 1) update HOST_ADAPTERS in content.js, 2) update
+// AI_TAB_URL_PATTERNS in background.js, 3) extend this regex below.
+const AI_TAB_URL_REGEX = /^https:\/\/(claude\.ai|chatgpt\.com|chat\.openai\.com)\//;
+
+async function getActiveAITab() {
   const tabs = await new Promise((resolve) =>
     chrome.tabs.query({ active: true, currentWindow: true }, (t) =>
       resolve(t || []),
@@ -109,13 +155,28 @@ async function getActiveClaudeTab() {
   );
   const tab = tabs[0];
   if (!tab) return { ok: false, error: 'No active tab.' };
-  if (!/^https:\/\/claude\.ai\//.test(tab.url || '')) {
-    return { ok: false, error: 'The current tab is not claude.ai.' };
+  if (!AI_TAB_URL_REGEX.test(tab.url || '')) {
+    return {
+      ok: false,
+      error: 'The current tab is not Claude.ai or ChatGPT.com.',
+    };
   }
   return { ok: true, tab };
 }
 
-function sendTab(tabId, message) {
+// Chrome reports "Could not establish connection. Receiving end does
+// not exist." when sendMessage targets a tab whose content script
+// isn't loaded — typically because the AI chat tab existed BEFORE
+// the extension was installed / reloaded. manifest.json content
+// scripts don't retroactively attach to pre-existing tabs. When we
+// see this error we inject src/content.js on-demand and retry once,
+// which removes the "reload the tab" requirement entirely.
+function isMissingReceiverError(msg) {
+  if (!msg) return false;
+  return /Receiving end does not exist|Could not establish connection/i.test(msg);
+}
+
+function rawSendTab(tabId, message) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, message, (resp) => {
       if (chrome.runtime.lastError) {
@@ -123,13 +184,45 @@ function sendTab(tabId, message) {
           ok: false,
           error:
             chrome.runtime.lastError.message ||
-            'Cannot reach the claude.ai tab.',
+            'Cannot reach the AI assistant tab.',
         });
       } else {
         resolve(resp || { ok: false, error: 'No response from content script.' });
       }
     });
   });
+}
+
+async function injectAITabContentScript(tabId) {
+  if (!chrome.scripting?.executeScript) {
+    return { ok: false, error: 'chrome.scripting unavailable.' };
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['src/content.js'],
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+async function sendTab(tabId, message) {
+  const first = await rawSendTab(tabId, message);
+  if (first.ok || !isMissingReceiverError(first.error)) return first;
+  const inject = await injectAITabContentScript(tabId);
+  if (!inject.ok) {
+    return {
+      ok: false,
+      error:
+        `Cannot attach content script to this tab (${inject.error}). ` +
+        'Reload the tab and try again.',
+    };
+  }
+  // Give the freshly-injected listener a tick to register before retry.
+  await new Promise((r) => setTimeout(r, 150));
+  return rawSendTab(tabId, message);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,17 +234,14 @@ function renderProviderUI() {
   const cfg = providers[settings.provider];
   const kind = PROVIDER_KIND[settings.provider] || 'api';
 
-  // Radio buttons
   document.querySelectorAll('input[name="provider"]').forEach((el) => {
     el.checked = el.value === settings.provider;
   });
 
-  // Show / hide web vs api sub-sections
   els.webSettings.hidden = kind !== 'web';
   els.apiSettings.hidden = kind === 'web';
 
   if (kind === 'web') {
-    // Web settings
     document.querySelectorAll('input[name="web-visible"]').forEach((el) => {
       el.checked = String(settings.webVisible) === el.value;
     });
@@ -161,9 +251,14 @@ function renderProviderUI() {
     ) {
       els.webCustomInstructions.value = settings.webCustomInstructions || '';
     }
-    els.settingsSummary.textContent = `${cfg.label} · ${settings.webVisible ? 'visible' : 'hidden'} tab`;
+    if (els.autoVerifyToggle) {
+      els.autoVerifyToggle.checked = !!settings.autoVerify;
+    }
+    if (els.inlineHighlightsToggle) {
+      // Default ON: if the value isn't a literal `false`, treat as on.
+      els.inlineHighlightsToggle.checked = settings.inlineHighlights !== false;
+    }
   } else {
-    // API settings
     const stored =
       settings.provider === 'perplexity'
         ? settings.perplexityKey
@@ -184,9 +279,6 @@ function renderProviderUI() {
       els.modelSelect.appendChild(opt);
     }
     els.modelSelect.value = settings.model;
-
-    const hasKey = !!stored;
-    els.settingsSummary.textContent = `${cfg.label} · ${settings.model} · ${hasKey ? 'key saved' : 'no key'}`;
   }
 }
 
@@ -212,13 +304,11 @@ async function renderWebStatus() {
   }
 }
 
-function renderContextUI() {
-  const ctx = state.settings.context || '';
-  els.contextInput.value = ctx;
-  const trimmed = ctx.trim();
-  els.contextSummary.textContent = trimmed
-    ? `${trimmed.length} chars saved`
-    : 'Empty — optional but recommended';
+function renderContext() {
+  const ctx = state.settings?.context || '';
+  if (document.activeElement !== els.contextInput && els.contextInput.value !== ctx) {
+    els.contextInput.value = ctx;
+  }
 }
 
 function renderStats() {
@@ -241,7 +331,6 @@ function renderStats() {
   }
 
   renderVerdict(s.lastVerdict);
-  // Re-verify button is only visible when we have a verdict to re-verify.
   els.reverifyBtn.hidden = !s.lastVerdict;
 }
 
@@ -302,14 +391,39 @@ function renderVerdict(verdict) {
 }
 
 // ---------------------------------------------------------------------------
-// Event handlers
+// Header / view-switch handlers
+// ---------------------------------------------------------------------------
+
+els.openSettingsBtn.addEventListener('click', () => showView('settings'));
+els.closeSettingsBtn.addEventListener('click', () => showView('home'));
+
+els.kebabBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (els.kebabMenu.hidden) openKebabMenu();
+  else closeKebabMenu();
+});
+
+els.menuFreshThread.addEventListener('click', async () => {
+  closeKebabMenu();
+  await sendBg({ type: 'RESET_PERPLEXITY_THREAD' });
+  await refreshState();
+  await renderWebStatus();
+});
+
+els.menuResetStats.addEventListener('click', async () => {
+  closeKebabMenu();
+  await sendBg({ type: 'RESET_STATS' });
+  await refreshState();
+});
+
+// ---------------------------------------------------------------------------
+// Settings handlers
 // ---------------------------------------------------------------------------
 
 document.querySelectorAll('input[name="provider"]').forEach((el) => {
   el.addEventListener('change', () => {
     if (!state.settings) return;
     state.settings.provider = el.value;
-    // Reset model to provider default if current model isn't valid here.
     const cfg = state.providers[el.value];
     if (!cfg.models.some((m) => m.id === state.settings.model)) {
       state.settings.model = cfg.defaultModel;
@@ -332,7 +446,6 @@ els.webCustomInstructions?.addEventListener('input', () => {
 });
 
 els.resetWebInstructions?.addEventListener('click', async () => {
-  // Send empty string — background resolves it to the built-in default.
   await sendBg({
     type: 'SAVE_SETTINGS',
     webCustomInstructions: '',
@@ -366,77 +479,74 @@ els.apiKey.addEventListener('input', () => {
   } else if (state.settings.provider === 'openrouter') {
     state.settings.openrouterKey = key;
   }
-  // Ignore inputs while on the web provider (the field is hidden).
+});
+
+els.contextInput.addEventListener('input', () => {
+  if (!state.settings) return;
+  state.settings.context = els.contextInput.value;
+});
+
+els.autoVerifyToggle?.addEventListener('change', async () => {
+  if (!state.settings) return;
+  const next = els.autoVerifyToggle.checked;
+  state.settings.autoVerify = next;
+  // Persist immediately so the content script picks up the change without
+  // requiring the user to click "Save settings".
+  await sendBg({ type: 'SAVE_SETTINGS', autoVerify: next });
+});
+
+els.inlineHighlightsToggle?.addEventListener('change', async () => {
+  if (!state.settings) return;
+  const next = els.inlineHighlightsToggle.checked;
+  state.settings.inlineHighlights = next;
+  await sendBg({ type: 'SAVE_SETTINGS', inlineHighlights: next });
+  // If user turned the feature off, ask the active AI tab's content script
+  // to tear down any highlights currently rendered.
+  if (!next) {
+    const aiTab = await getActiveAITab();
+    if (aiTab.ok) {
+      await sendTab(aiTab.tab.id, { type: 'CLEAR_HIGHLIGHTS' });
+    }
+  }
 });
 
 els.saveSettings.addEventListener('click', async () => {
   flash(els.saveSettings, 'Saving…', true);
-  const resp = await sendBg({
-    type: 'SAVE_SETTINGS',
-    provider: state.settings.provider,
-    perplexityKey: state.settings.perplexityKey,
-    openrouterKey: state.settings.openrouterKey,
-    model: state.settings.model,
-    webVisible: state.settings.webVisible,
-    webCustomInstructions: state.settings.webCustomInstructions,
-  });
-  if (resp.ok) {
+  const [settingsResp, contextResp] = await Promise.all([
+    sendBg({
+      type: 'SAVE_SETTINGS',
+      provider: state.settings.provider,
+      perplexityKey: state.settings.perplexityKey,
+      openrouterKey: state.settings.openrouterKey,
+      model: state.settings.model,
+      webVisible: state.settings.webVisible,
+      webCustomInstructions: state.settings.webCustomInstructions,
+      autoVerify: !!state.settings.autoVerify,
+      inlineHighlights: state.settings.inlineHighlights !== false,
+    }),
+    sendBg({
+      type: 'SET_CONTEXT',
+      text: els.contextInput.value,
+    }),
+  ]);
+  if (settingsResp.ok && contextResp.ok) {
     await refreshState();
     await renderWebStatus();
     flash(els.saveSettings, 'Saved');
+    els.contextStatus.textContent =
+      (els.contextInput.value || '').trim()
+        ? `Context saved (${(els.contextInput.value || '').trim().length} chars).`
+        : '';
   } else {
     flash(els.saveSettings, 'Failed');
+    els.contextStatus.textContent =
+      settingsResp.error || contextResp.error || 'Failed to save settings.';
   }
 });
 
-els.saveContext.addEventListener('click', async () => {
-  flash(els.saveContext, 'Saving…', true);
-  const resp = await sendBg({
-    type: 'SET_CONTEXT',
-    text: els.contextInput.value,
-  });
-  if (resp.ok) {
-    await refreshState();
-    flash(els.saveContext, 'Saved');
-    els.contextStatus.textContent = 'Context saved. It will be prepended to every Verify call.';
-  } else {
-    flash(els.saveContext, 'Failed');
-    els.contextStatus.textContent = resp.error || 'Failed to save context.';
-  }
-});
-
-async function pasteContextHelper(send) {
-  const text = els.contextInput.value.trim();
-  if (!text) {
-    els.contextStatus.textContent = 'Type some context first.';
-    return;
-  }
-  // Save first so it's persisted regardless of paste result.
-  await sendBg({ type: 'SET_CONTEXT', text });
-  await refreshState();
-
-  const tabResp = await getActiveClaudeTab();
-  if (!tabResp.ok) {
-    els.contextStatus.textContent = tabResp.error;
-    return;
-  }
-  const wrapped = `For our entire chat, use this context. ${text}`;
-  const out = await sendTab(tabResp.tab.id, {
-    type: 'INJECT_TEXT',
-    text: wrapped,
-    send,
-  });
-  if (!out.ok) {
-    els.contextStatus.textContent = out.error || 'Injection failed.';
-  } else {
-    els.contextStatus.textContent = send
-      ? 'Context sent to Claude.'
-      : 'Context pasted into Claude composer.';
-  }
-}
-
-els.pasteContext.addEventListener('click', () => pasteContextHelper(false));
-els.pasteSendContext.addEventListener('click', () => pasteContextHelper(true));
+// ---------------------------------------------------------------------------
+// Verify + correction handlers
+// ---------------------------------------------------------------------------
 
 async function runVerify({ force }) {
   els.statusError.hidden = true;
@@ -448,7 +558,7 @@ async function runVerify({ force }) {
   els.statusLabel.textContent = STATUS_LABELS.checking;
 
   try {
-    const tabResp = await getActiveClaudeTab();
+    const tabResp = await getActiveAITab();
     if (!tabResp.ok) {
       els.statusDot.className = 'status-dot error';
       els.statusLabel.textContent = STATUS_LABELS.error;
@@ -462,7 +572,7 @@ async function runVerify({ force }) {
       els.statusDot.className = 'status-dot error';
       els.statusLabel.textContent = STATUS_LABELS.error;
       els.statusError.hidden = false;
-      els.statusError.textContent = latest.error || 'Could not read Claude response.';
+      els.statusError.textContent = latest.error || 'Could not read the assistant response.';
       return;
     }
 
@@ -477,8 +587,6 @@ async function runVerify({ force }) {
     } else if (verifyResp.fromCache) {
       els.cacheFlag.hidden = false;
     }
-    // The background already wrote stats + verdict to session storage, which
-    // the storage listener picks up to refresh the UI.
     await refreshState();
     await renderWebStatus();
   } finally {
@@ -493,7 +601,7 @@ els.reverifyBtn.addEventListener('click', () => runVerify({ force: true }));
 async function injectCorrection(send) {
   const text = (els.correctionText.textContent || '').trim();
   if (!text) return;
-  const tabResp = await getActiveClaudeTab();
+  const tabResp = await getActiveAITab();
   if (!tabResp.ok) {
     els.statusError.hidden = false;
     els.statusError.textContent = tabResp.error;
@@ -524,17 +632,14 @@ els.copyCorrection.addEventListener('click', async () => {
   }
 });
 
-els.resetStats.addEventListener('click', async () => {
-  await sendBg({ type: 'RESET_STATS' });
-  await refreshState();
-});
+// ---------------------------------------------------------------------------
+// Live updates
+// ---------------------------------------------------------------------------
 
-// Live updates: any storage.session change re-fetches state.
 chrome.storage.onChanged.addListener((_changes, area) => {
   if (area === 'session') refreshState();
 });
 
-// Update tab warning when the user switches tabs.
 chrome.tabs?.onActivated.addListener(() => updateTabWarning());
 chrome.tabs?.onUpdated.addListener((_id, info) => {
   if (info.url || info.status === 'complete') updateTabWarning();
@@ -565,7 +670,7 @@ async function refreshState() {
     stats: resp.stats,
   };
   renderProviderUI();
-  renderContextUI();
+  renderContext();
   renderStats();
 }
 
@@ -580,15 +685,98 @@ function startWebStatusPolling() {
 }
 
 async function updateTabWarning() {
-  const tabResp = await getActiveClaudeTab();
+  const tabResp = await getActiveAITab();
   els.tabWarning.hidden = tabResp.ok;
 }
 
 startWebStatusPolling();
 
+// ---------------------------------------------------------------------------
+// Close-panel button + per-section <details> persistence
+//
+// The header X button calls window.close() which fully collapses the
+// Chrome side panel for the current window. Reopening is handled by the
+// toolbar action (background.js sets openPanelOnActionClick: true), so
+// the user just clicks the extension icon in the toolbar to bring the
+// panel back.
+//
+// Separately, the Issues / Correction / Sources <details> sections
+// inside the result card persist their open/closed state across panel
+// re-opens via chrome.storage.session.
+// ---------------------------------------------------------------------------
+
+const PANEL_LAYOUT_KEY = 'panelLayout';
+const DEFAULT_SECTIONS = { issues: true, correction: true, citations: true };
+
+let panelSections = { ...DEFAULT_SECTIONS };
+
+function applySectionOpenState() {
+  document.querySelectorAll('details.collapsible[data-key]').forEach((d) => {
+    const key = d.getAttribute('data-key');
+    if (!key) return;
+    const open = panelSections[key];
+    if (open === false) d.removeAttribute('open');
+    else d.setAttribute('open', '');
+  });
+}
+
+function persistPanelSections() {
+  try {
+    chrome.storage.session.set({
+      [PANEL_LAYOUT_KEY]: { sections: panelSections },
+    });
+  } catch (_) {
+    /* session storage may be unavailable in old Chrome; ignore */
+  }
+}
+
+async function loadPanelSections() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.session.get([PANEL_LAYOUT_KEY], (data) => {
+        const saved = data && data[PANEL_LAYOUT_KEY];
+        if (saved && typeof saved === 'object' && saved.sections) {
+          panelSections = { ...DEFAULT_SECTIONS, ...saved.sections };
+        }
+        resolve();
+      });
+    } catch (_) {
+      resolve();
+    }
+  });
+}
+
+function wireCollapsibleHandlers() {
+  // Close the entire side panel. Chrome's Side Panel API lets the panel
+  // close itself via window.close(); the toolbar icon is the one-click
+  // way back in (background.js: setPanelBehavior({ openPanelOnActionClick: true })).
+  els.closePanelBtn?.addEventListener('click', () => {
+    try {
+      window.close();
+    } catch (_) {
+      /* should never throw in a side-panel context */
+    }
+  });
+
+  // Persist native <details> toggle state.
+  document
+    .querySelectorAll('details.collapsible[data-key]')
+    .forEach((d) => {
+      d.addEventListener('toggle', () => {
+        const key = d.getAttribute('data-key');
+        if (!key) return;
+        panelSections[key] = d.open;
+        persistPanelSections();
+      });
+    });
+}
+
 (async function init() {
   const manifest = chrome.runtime.getManifest();
   els.versionLabel.textContent = `v${manifest.version}`;
+  await loadPanelSections();
+  applySectionOpenState();
+  wireCollapsibleHandlers();
   await refreshState();
   updateTabWarning();
 })();
