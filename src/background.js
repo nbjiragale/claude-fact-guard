@@ -283,6 +283,8 @@ async function getSettings() {
     STORAGE_KEYS.context,
     STORAGE_KEYS.webVisible,
     STORAGE_KEYS.webCustomInstructions,
+    STORAGE_KEYS.autoVerify,
+    STORAGE_KEYS.inlineHighlights,
   ]);
   if (isLegacyManagedDefault(data[STORAGE_KEYS.webCustomInstructions])) {
     // Clear the stale stored value so the new default applies. Fire-and-forget
